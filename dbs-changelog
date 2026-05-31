@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Synthesise a debian/changelog from a project's git history.
+
+Drop-in replacement for the shell `cl_*` functions that used to live in `dbs`.
+Given a project directory (one holding `debian/control` and usually
+`debian/rules`), it:
+
+  * detects the upstream source tree via `--sourcedirectory` in debian/rules,
+  * reads the source package name and maintainer from debian/control,
+  * walks the git history of the source tree and emits one changelog stanza
+    per release tag (newest first), plus a leading snapshot stanza when HEAD
+    sits ahead of the newest tag.
+
+The resulting changelog is written to stdout; diagnostics go to stderr. The
+project on disk is never modified — `dbs` bind-mounts the output into the
+build container.
+
+Versioning mirrors the old shell generator exactly:
+  * version is extracted from any tag shape (`v0.24.3`, `0.24.3`,
+    `release-1.2.3`); `-` becomes `~` for correct Debian ordering,
+  * `tag+N` for N commits on top of a tag (describe-style snapshot),
+  * `0.0.1+N` when no tag yields a version, bare `0.0.1` when not a git repo,
+  * distribution is `stable` only when exactly on a release tag (no `+N`) and
+    the major version is >= 1; otherwise `unstable`.
+
+Requires GitPython (Debian/Ubuntu: `sudo apt install python3-git`) and the
+`git` binary.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+try:
+    import git  # GitPython
+except ImportError:
+    sys.exit(
+        "dbs-changelog: GitPython is required — install it with "
+        "`sudo apt install python3-git` (Debian/Ubuntu) or `pip install GitPython` "
+        "inside a virtualenv."
+    )
+
+URGENCY = "medium"
+FALLBACK_NAME = "special-delivery"
+FALLBACK_EMAIL = "development@special-delivery.org"
+
+# A `dh` stub (see the `dh-stub` file next to this script) dropped on PATH so
+# that `make` runs debian/rules and echoes the --sourcedirectory option for us
+# (with all make variables already expanded).
+DH_STUB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dh-stub")
+
+
+# --------------------------------------------------------------------------
+# debian/ metadata
+# --------------------------------------------------------------------------
+def read_control_field(control: str, field: str) -> str:
+    """First value of `field` in debian/control (case-insensitive, line-start)."""
+    if not os.path.isfile(control):
+        return ""
+    pat = re.compile(r"^" + re.escape(field) + r":", re.IGNORECASE)
+    with open(control, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if pat.match(line):
+                return re.sub(r"^[^:]*:\s*", "", line)
+    return ""
+
+
+def maintainer_name(control: str) -> str:
+    """The Maintainer field with any `<email>` (and trailing text) stripped."""
+    value = read_control_field(control, "Maintainer")
+    return re.sub(r"\s*<[^>]*>.*", "", value)
+
+
+def read_sourcedirectory(rules: str) -> str:
+    """Read `--sourcedirectory` from debian/rules.
+
+    Primary path: run `make` on debian/rules with a stub `dh` on PATH that
+    echoes the option, so make variables expand naturally. Fallback: scrape
+    the option out of the file with a regex.
+    """
+    if not os.path.isfile(rules):
+        return ""
+    root = os.path.dirname(os.path.dirname(rules))  # project dir (parent of debian/)
+
+    out = ""
+    if shutil.which("make"):
+        with tempfile.TemporaryDirectory() as stub:
+            dh = os.path.join(stub, "dh")
+            shutil.copy(DH_STUB_PATH, dh)
+            os.chmod(dh, 0o755)
+            env = dict(os.environ, PATH=stub + os.pathsep + os.environ.get("PATH", ""))
+            try:
+                res = subprocess.run(
+                    ["make", "-s", "-C", root, "-f", "debian/rules", "dbs-detect-sourcedir"],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                first = res.stdout.splitlines()
+                out = first[0] if first else ""
+            except OSError:
+                out = ""
+
+    if not out:
+        with open(rules, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                # The old sed used a greedy `.*` prefix, so on a line with more
+                # than one option it kept the LAST match; replicate that.
+                matches = re.findall(r"--source(?:directory|dir)[= ]+['\"]?([^\s'\"]+)", line)
+                if matches:
+                    out = matches[-1]
+                    break
+    return out
+
+
+# --------------------------------------------------------------------------
+# version / distribution
+# --------------------------------------------------------------------------
+def tag_version(tag: str) -> str | None:
+    """Extract a Debian upstream version from a tag, or None if it has none.
+
+    `v0.24.3`/`0.24.3` -> `0.24.3`; `release-1.2.3` -> `1.2.3`. A `-` in the
+    version becomes `~` (pre-release ordering).
+    """
+    m = re.match(r"^v?([0-9][0-9A-Za-z.~+-]*)$", tag)
+    if m:
+        ver = m.group(1)
+    else:
+        m = re.search(r"[0-9]+(?:\.[0-9]+)+[.~+A-Za-z0-9-]*", tag)
+        if not m:
+            return None
+        ver = m.group(0)
+    return ver.replace("-", "~")
+
+
+def dist_for_version(ver: str) -> str:
+    """`stable` only when exactly on a release (no `+`) with major >= 1."""
+    if "+" in ver:
+        return "unstable"
+    m = re.match(r"[0-9]+", ver)
+    if m and int(m.group(0)) >= 1:
+        return "stable"
+    return "unstable"
+
+
+def rfc2822_now() -> str:
+    """Current local time in the same shape git's `%aD` / `date -R` produces."""
+    return datetime.datetime.now().astimezone().strftime("%a, %d %b %Y %H:%M:%S %z")
+
+
+# --------------------------------------------------------------------------
+# git access (GitPython)
+# --------------------------------------------------------------------------
+def commit_meta(repo: "git.Repo", ref: str) -> tuple[str, str, str]:
+    """Author name, e-mail and RFC2822 date (`%aD`) of a commit-ish.
+
+    The three fields are 0x1f-separated, but an author ident may itself contain
+    a 0x1f byte (git stores it verbatim). Mirroring the original shell, take the
+    first field as the name, the second as the e-mail and the last as the date,
+    rather than assuming exactly three fields (which would crash on such idents).
+    """
+    meta = repo.git.log("-1", "--format=%an%x1f%ae%x1f%aD", ref)
+    fields = meta.split("\x1f")
+    return fields[0], fields[1], fields[-1]
+
+
+def log_subjects(repo: "git.Repo", revrange: str) -> list[str]:
+    """Commit subjects (`%s`) for a revision or range, oldest-newest as git emits."""
+    out = repo.git.log("--format=%s", revrange)
+    return out.split("\n") if out else []
+
+
+# --------------------------------------------------------------------------
+# changelog assembly
+# --------------------------------------------------------------------------
+def emit_entry(pkg, ver, name, email, date, fallback, body):
+    """Format one changelog stanza (without a trailing newline).
+
+    Empty subject lines are dropped; an otherwise empty body falls back to
+    `fallback`. Missing author fields fall back to the defaults.
+    """
+    name = name or FALLBACK_NAME
+    email = email or FALLBACK_EMAIL
+    date = date or rfc2822_now()
+
+    lines = [f"{pkg} ({ver}) {dist_for_version(ver)}; urgency={URGENCY}", ""]
+    subjects = [s for s in body if s]
+    if subjects:
+        lines += [f"  * {s}" for s in subjects]
+    else:
+        lines.append(f"  * {fallback}")
+    lines += ["", f" -- {name} <{email}>  {date}"]
+    return "\n".join(lines)
+
+
+def generate(src: str, pkg: str, control: str) -> str:
+    """Build a complete debian/changelog for `pkg` from the git history at `src`."""
+    fb_name = maintainer_name(control) or FALLBACK_NAME
+
+    # Not a git repo, or a repo with no commits -> single fallback entry.
+    try:
+        repo = git.Repo(src, search_parent_directories=True)
+        has_head = repo.head.is_valid()
+    except (git.InvalidGitRepositoryError, git.NoSuchPathError):
+        repo, has_head = None, False
+    if repo is None or not has_head:
+        stanza = emit_entry(pkg, "0.0.1", fb_name, FALLBACK_EMAIL,
+                            rfc2822_now(), "Initial version", [])
+        return stanza + "\n"
+
+    # Release tags merged into HEAD, newest first, keeping only those that
+    # yield a version.
+    raw_tags = repo.git.tag("--merged", "HEAD", "--sort=-creatordate")
+    tags = [t for t in raw_tags.split("\n") if t and tag_version(t) is not None]
+
+    # No usable tag -> a single 0.0.1+<commits> snapshot off the whole history.
+    if not tags:
+        name, email, date = commit_meta(repo, "HEAD")
+        count = repo.git.rev_list("--count", "HEAD")
+        stanza = emit_entry(pkg, f"0.0.1+{count}", name, email, date,
+                            "Initial version", log_subjects(repo, "HEAD"))
+        return stanza + "\n"
+
+    stanzas = []
+
+    # Commits on top of the newest tag -> a leading snapshot stanza.
+    nearest = tags[0]
+    ahead = repo.git.rev_list("--count", f"{nearest}..HEAD")
+    if int(ahead) > 0:
+        name, email, date = commit_meta(repo, "HEAD")
+        ver = f"{tag_version(nearest)}+{ahead}"
+        stanzas.append(emit_entry(pkg, ver, name, email, date, "Snapshot build",
+                                  log_subjects(repo, f"{nearest}..HEAD")))
+
+    # One stanza per tag, newest -> oldest. Body is the commits introduced
+    # since the previous (older) tag; the oldest tag reaches back to the root.
+    for i, tag in enumerate(tags):
+        prev = tags[i + 1] if i + 1 < len(tags) else None
+        revrange = f"{prev}..{tag}" if prev else tag
+        ver = tag_version(tag)
+        name, email, date = commit_meta(repo, f"{tag}^{{commit}}")
+        stanzas.append(emit_entry(pkg, ver, name, email, date,
+                                  f"Released version {ver}", log_subjects(repo, revrange)))
+
+    return "\n\n".join(stanzas) + "\n"
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Synthesise a debian/changelog from a project's git history.")
+    ap.add_argument("project", help="project directory containing debian/control")
+    ap.add_argument("--source",
+                    help="override the source tree (default: from --sourcedirectory)")
+    ap.add_argument("--package",
+                    help="override the source package name (default: control Source)")
+    args = ap.parse_args()
+
+    project = os.path.abspath(args.project)
+    control = os.path.join(project, "debian", "control")
+
+    if args.source:
+        src = os.path.abspath(args.source)
+    else:
+        sourcedir = read_sourcedirectory(os.path.join(project, "debian", "rules"))
+        # Mirror the shell's "$PROJECT_DIR/$sourcedir": --sourcedirectory is
+        # relative by Debian convention, so join by plain concatenation rather
+        # than os.path.join (which would silently drop the project for an
+        # absolute value).
+        src = f"{project}/{sourcedir}" if sourcedir else project
+
+    pkg = args.package or read_control_field(control, "Source") or os.path.basename(project)
+
+    print(f"dbs-changelog: source={src} package={pkg}", file=sys.stderr)
+    sys.stdout.write(generate(src, pkg, control))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --sourcedirectory=*|--sourcedir=*) printf '%s\n' "${arg#*=}" ;;
+        -D?*)                              printf '%s\n' "${arg#-D}" ;;
+    esac
+done
+exit 0
