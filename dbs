@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-BUILDER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BUILDER_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
 PROJECT_DIR="$PWD"
 
 # First non-option argument is the project to build; default to the caller's CWD.
@@ -15,7 +15,7 @@ fi
 
 PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd)"
 if [ ! -f "$PROJECT_DIR/debian/control" ]; then
-    echo "build.sh: '$PROJECT_DIR' has no debian/control — not a buildable project" >&2
+    echo "dbs: '$PROJECT_DIR' has no debian/control — not a buildable project" >&2
     exit 1
 fi
 
