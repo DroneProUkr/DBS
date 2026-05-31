@@ -8,6 +8,11 @@ mkdir -p "$BUILD"
 cp -r "$WORKSPACE"/. "$BUILD"
 cd "$BUILD"
 
+if [ ! -f debian/changelog ] && [ -f /run/dbs/changelog ]; then
+    mkdir -p debian
+    cp /run/dbs/changelog debian/changelog
+fi
+
 export CMAKE_TOOLCHAIN_FILE="${1:-/opt/rpi-arm64.toolchain.cmake}"
 
 cat "$SYSROOT"/var/lib/dpkg/info/*.shlibs > debian/shlibs.local

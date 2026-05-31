@@ -19,10 +19,165 @@ if [ ! -f "$PROJECT_DIR/debian/control" ]; then
     exit 1
 fi
 
-# The image bakes the target's build-dependencies into the sysroot at build time
-# (mk-build-deps reads debian/control). Since the build context is this builder
-# repo, assemble a temporary context that combines the builder files with the
-# target's debian/control.
+# --- debian/changelog synthesis -------------------------------------------
+CL_URGENCY=medium
+CL_FALLBACK_EMAIL=development@special-delivery.org
+CL_FALLBACK_NAME=special-delivery
+
+cl_read_sourcedirectory() {
+    local rules="$1" out="" root stub
+    [ -f "$rules" ] || return 0
+    root="$(dirname "$(dirname "$rules")")"
+
+    if command -v make >/dev/null 2>&1; then
+        stub="$(mktemp -d)"
+        cat > "$stub/dh" <<'STUB'
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --sourcedirectory=*|--sourcedir=*) printf '%s\n' "${arg#*=}" ;;
+        -D?*)                              printf '%s\n' "${arg#-D}" ;;
+    esac
+done
+exit 0
+STUB
+        chmod +x "$stub/dh"
+        out="$(PATH="$stub:$PATH" make -s -C "$root" -f debian/rules \
+               dbs-detect-sourcedir 2>/dev/null | head -n1)" || true
+        rm -rf "$stub"
+    fi
+
+    if [ -z "$out" ]; then
+        out="$(sed -nE "s/.*--source(directory|dir)[= ]+['\"]?([^[:space:]'\"]+).*/\2/p" \
+               "$rules" | head -n1)"
+    fi
+    printf '%s' "$out"
+}
+
+# A field value from debian/control (first occurrence).
+cl_read_control_field() {
+    local control="$1" field="$2"
+    awk -v f="$field" 'BEGIN{f=tolower(f)}
+        tolower($1)==f":" || tolower(substr($0,1,length(f)+1))==f":" {
+            sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$control"
+}
+
+cl_tag_version() {
+    local tag="$1" v
+    if [[ "$tag" =~ ^v?([0-9][0-9A-Za-z.~+-]*)$ ]]; then
+        v="${BASH_REMATCH[1]}"
+    elif [[ "$tag" =~ ([0-9]+(\.[0-9]+)+([.~+A-Za-z0-9-]*)?) ]]; then
+        v="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+    printf '%s' "${v//-/\~}"
+}
+
+# Read author name/e-mail/date of a commit-ish into G_NAME/G_EMAIL/G_DATE.
+cl_commit_meta() {
+    local repo="$1" ref="$2" meta
+    G_NAME=""; G_EMAIL=""; G_DATE=""
+    meta="$(git -C "$repo" log -1 --format='%an%x1f%ae%x1f%aD' "$ref" 2>/dev/null)" || return 1
+    G_NAME="${meta%%$'\x1f'*}"; meta="${meta#*$'\x1f'}"
+    G_EMAIL="${meta%%$'\x1f'*}"; G_DATE="${meta##*$'\x1f'}"
+}
+
+# Pick the changelog distribution for a version string.
+cl_dist_for_version() {
+    local ver="$1" major
+    case "$ver" in *+*) printf 'unstable'; return ;; esac
+    major="${ver%%[!0-9]*}"
+    if [ -n "$major" ] && [ "$major" -ge 1 ] 2>/dev/null; then
+        printf 'stable'
+    else
+        printf 'unstable'
+    fi
+}
+
+# Format one changelog stanza. Body is taken from stdin (one subject per line);
+# blank lines are dropped, and an empty body falls back to $6.
+cl_emit_entry() {
+    local pkg="$1" ver="$2" name="$3" email="$4" date="$5" fallback="$6"
+    [ -n "$name" ]  || name="$CL_FALLBACK_NAME"
+    [ -n "$email" ] || email="$CL_FALLBACK_EMAIL"
+    [ -n "$date" ]  || date="$(date -R)"
+    printf '%s (%s) %s; urgency=%s\n\n' "$pkg" "$ver" "$(cl_dist_for_version "$ver")" "$CL_URGENCY"
+    local line had=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '  * %s\n' "$line"
+        had=1
+    done
+    [ "$had" -eq 1 ] || printf '  * %s\n' "$fallback"
+    printf '\n -- %s <%s>  %s\n' "$name" "$email" "$date"
+}
+
+# Write a complete debian/changelog to stdout for source package $pkg,
+# derived from the git history in $repo. $control supplies fallback names.
+cl_generate() {
+    local repo="$1" pkg="$2" control="$3"
+    local fb_name
+    fb_name="$(cl_read_control_field "$control" Maintainer | sed -E 's/[[:space:]]*<[^>]*>.*//')"
+    [ -n "$fb_name" ] || fb_name="$CL_FALLBACK_NAME"
+
+    # Not a git repo, or a repo with no commits -> single fallback entry.
+    if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 \
+       || ! git -C "$repo" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        cl_emit_entry "$pkg" "0.0.1" "$fb_name" "$CL_FALLBACK_EMAIL" "$(date -R)" \
+            "Initial version" </dev/null
+        return 0
+    fi
+
+    local tags=() t
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        cl_tag_version "$t" >/dev/null 2>&1 && tags+=("$t")
+    done < <(git -C "$repo" tag --merged HEAD --sort=-creatordate 2>/dev/null)
+
+    if [ "${#tags[@]}" -eq 0 ]; then
+        cl_commit_meta "$repo" HEAD || true
+        local count
+        count="$(git -C "$repo" rev-list --count HEAD 2>/dev/null || echo 0)"
+        git -C "$repo" log --format='%s' HEAD \
+            | cl_emit_entry "$pkg" "0.0.1+$count" "$G_NAME" "$G_EMAIL" "$G_DATE" "Initial version"
+        return 0
+    fi
+
+    local entries=() i tag prev range ver body first
+
+    local nearest ahead
+    nearest="${tags[0]}"
+    ahead="$(git -C "$repo" rev-list --count "${nearest}..HEAD" 2>/dev/null || echo 0)"
+    if [ "$ahead" -gt 0 ]; then
+        cl_commit_meta "$repo" HEAD || true
+        body="$(git -C "$repo" log --format='%s' "${nearest}..HEAD")"
+        entries+=("$(printf '%s\n' "$body" | cl_emit_entry "$pkg" \
+            "$(cl_tag_version "$nearest")+$ahead" \
+            "$G_NAME" "$G_EMAIL" "$G_DATE" "Snapshot build")")
+    fi
+
+    # One entry per tag, newest -> oldest. The body is the commits introduced
+    # since the previous (older) tag; the oldest tag covers history back to root.
+    for i in "${!tags[@]}"; do
+        tag="${tags[$i]}"
+        prev=""
+        [ $((i + 1)) -lt "${#tags[@]}" ] && prev="${tags[$((i + 1))]}"
+        if [ -n "$prev" ]; then range="${prev}..${tag}"; else range="$tag"; fi
+        ver="$(cl_tag_version "$tag")"
+        cl_commit_meta "$repo" "${tag}^{commit}" || true
+        body="$(git -C "$repo" log --format='%s' "$range")"
+        entries+=("$(printf '%s\n' "$body" | cl_emit_entry "$pkg" "$ver" \
+            "$G_NAME" "$G_EMAIL" "$G_DATE" "Released version $ver")")
+    done
+
+    first=1
+    for i in "${!entries[@]}"; do
+        [ "$first" -eq 1 ] && first=0 || printf '\n'
+        printf '%s\n' "${entries[$i]}"
+    done
+}
+
 CTX="$(mktemp -d)"
 trap 'rm -rf "$CTX"' EXIT
 cp "$BUILDER_DIR/Dockerfile" \
@@ -33,5 +188,21 @@ cp "$BUILDER_DIR/Dockerfile" \
 mkdir -p "$CTX/debian"
 cp "$PROJECT_DIR/debian/control" "$CTX/debian/control"
 
+# Synthesise debian/changelog when the project does not ship one.
+GEN_CL=""
+if [ ! -f "$PROJECT_DIR/debian/changelog" ]; then
+    sourcedir="$(cl_read_sourcedirectory "$PROJECT_DIR/debian/rules")"
+    if [ -n "$sourcedir" ]; then SRC="$PROJECT_DIR/$sourcedir"; else SRC="$PROJECT_DIR"; fi
+    pkg="$(cl_read_control_field "$PROJECT_DIR/debian/control" Source)"
+    [ -n "$pkg" ] || pkg="$(basename "$PROJECT_DIR")"
+    GEN_CL="$CTX/changelog"
+    echo "dbs: no debian/changelog — generating from '$SRC'" >&2
+    cl_generate "$SRC" "$pkg" "$PROJECT_DIR/debian/control" > "$GEN_CL"
+    echo "dbs: generated $(head -n1 "$GEN_CL")" >&2
+fi
+
 docker build --progress=plain "$@" --platform linux/amd64 -t rpi64-builder "$CTX"
-docker run --rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace" rpi64-builder
+
+run_args=(--rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace")
+[ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
+docker run "${run_args[@]}" rpi64-builder
