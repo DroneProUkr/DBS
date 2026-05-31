@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+
+BUILDER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$PWD"
+
+# First non-option argument is the project to build; default to the caller's CWD.
+if [ "${1:-}" != "" ] && [ "${1:-}" != "--" ]; then
+    PROJECT_DIR="$1"
+    shift
+fi
+
+# Drop an optional "--" separator before extra docker build args.
+[ "${1:-}" = "--" ] && shift
+
+PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd)"
+if [ ! -f "$PROJECT_DIR/debian/control" ]; then
+    echo "build.sh: '$PROJECT_DIR' has no debian/control — not a buildable project" >&2
+    exit 1
+fi
+
+# The image bakes the target's build-dependencies into the sysroot at build time
+# (mk-build-deps reads debian/control). Since the build context is this builder
+# repo, assemble a temporary context that combines the builder files with the
+# target's debian/control.
+CTX="$(mktemp -d)"
+trap 'rm -rf "$CTX"' EXIT
+cp "$BUILDER_DIR/Dockerfile" \
+   "$BUILDER_DIR/crossbuild" \
+   "$BUILDER_DIR/aarch64-linux-gnu-pkg-config" \
+   "$BUILDER_DIR/rpi-arm64.toolchain.cmake" \
+   "$CTX/"
+mkdir -p "$CTX/debian"
+cp "$PROJECT_DIR/debian/control" "$CTX/debian/control"
+
+docker build --progress=plain "$@" --platform linux/amd64 -t rpi64-builder "$CTX"
+docker run --rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace" rpi64-builder

@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+SYSROOT=/sysroot
+WORKSPACE=/workspace
+BUILD=/build/src
+
+mkdir -p "$BUILD"
+cp -r "$WORKSPACE"/. "$BUILD"
+cd "$BUILD"
+
+export CMAKE_TOOLCHAIN_FILE="${1:-/opt/rpi-arm64.toolchain.cmake}"
+
+cat "$SYSROOT"/var/lib/dpkg/info/*.shlibs > debian/shlibs.local
+
+export LD_LIBRARY_PATH="$SYSROOT/usr/lib/aarch64-linux-gnu:$SYSROOT/lib/aarch64-linux-gnu:$SYSROOT/usr/lib"
+
+DEB_BUILD_OPTIONS=noautodbgsym dpkg-buildpackage -us -uc -b -d --host-arch arm64
+
+cp ../*.deb "$WORKSPACE"/
