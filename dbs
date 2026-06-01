@@ -55,30 +55,22 @@ cmd_init() {
 
     mkdir -p "$target/debian"
 
-    cat > "$target/debian/control" <<EOF
-Source: $pkg
-Section: misc
-Priority: optional
-Maintainer: special-delivery <development@special-delivery.org>
-Build-Depends: debhelper-compat (= 13)
-Standards-Version: 4.6.0
+    local tmpl="$BUILDER_DIR/templates/control"
+    if [ ! -f "$tmpl" ]; then
+        echo "dbs init: missing template '$tmpl' — broken dbs installation" >&2
+        exit 1
+    fi
+    local control
+    control="$(cat "$tmpl")"
+    printf '%s\n' "${control//@PKG@/$pkg}" > "$target/debian/control"
 
-Package: $pkg
-Architecture: any
-Depends: \${misc:Depends},
-         \${shlibs:Depends}
-Description: $pkg
- $pkg Debian package built with dbs.
- .
- Edit debian/control to describe this package and add its Build-Depends.
-EOF
-
-    # debian/rules — the tab before `dh` is required by make.
-    printf '#!/usr/bin/make -f\n\n%%:\n\tdh $@\n' > "$target/debian/rules"
+    local rules_tmpl="$BUILDER_DIR/templates/rules"
+    if [ ! -f "$rules_tmpl" ]; then
+        echo "dbs init: missing template '$rules_tmpl' — broken dbs installation" >&2
+        exit 1
+    fi
+    cp "$rules_tmpl" "$target/debian/rules"
     chmod +x "$target/debian/rules"
-
-    # No debian/source/format — dbs defaults it to `3.0 (native)` at build
-    # time (like debian/changelog), leaving the project tree minimal.
 
     echo "dbs init: created debian/ for package '$pkg' in $target" >&2
     echo "dbs init: build it with 'dbs' (from $target)" >&2

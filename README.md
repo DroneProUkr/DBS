@@ -65,12 +65,25 @@ you do **not** need them on the host.
 
 ## Installation
 
-`dbs` finds its helper files relative to itself, so it can be symlinked onto
-your `PATH`:
+One-liner — clones DBS into `~/bin`, symlinks the CLI, adds `~/bin` to your
+`PATH` (via `~/.bashrc`) if it isn't there already, and reports any missing
+runtime dependencies:
 
 ```sh
-git clone git@github.com:zarcsis/DBS.git ~/bin/DBS
-ln -s ~/bin/DBS/dbs ~/bin/dbs        # assuming ~/bin is on PATH
+curl -fsSL https://raw.githubusercontent.com/zarcsis/DBS/main/install.sh | sh
+```
+
+It's safe to re-run: an existing checkout is updated with `git pull` instead
+of re-cloned. To install somewhere other than `~/bin`, set `DBS_BIN_DIR`.
+
+`dbs` finds its helper files relative to itself, so the symlink is all it
+needs. The manual equivalent:
+
+```sh
+mkdir -p ~/bin                       # assuming ~/bin is on PATH
+cd ~/bin
+git clone https://github.com/zarcsis/DBS.git
+ln -s DBS/dbs .                      # ~/bin/dbs -> DBS/dbs
 ```
 
 ---
