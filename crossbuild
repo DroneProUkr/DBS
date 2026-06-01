@@ -4,21 +4,44 @@ SYSROOT=/sysroot
 WORKSPACE=/workspace
 BUILD=/build/src
 
+# Target suite / arch / triplet — provided by `dbs` via `docker run -e`, with
+# the trixie/arm64 defaults kept for a bare `docker run`.
+DBS_DIST="${DBS_DIST:-trixie}"
+DEB_HOST_ARCH="${DEB_HOST_ARCH:-arm64}"
+DEB_HOST_GNU_TYPE="${DEB_HOST_GNU_TYPE:-aarch64-linux-gnu}"
+
 mkdir -p "$BUILD"
 cp -r "$WORKSPACE"/. "$BUILD"
 cd "$BUILD"
+
+# Never carry a previous run's output tree into the build (it is bind-mounted
+# back from the workspace) — it must not be packaged or re-copied.
+rm -rf out
 
 if [ ! -f debian/changelog ] && [ -f /run/dbs/changelog ]; then
     mkdir -p debian
     cp /run/dbs/changelog debian/changelog
 fi
 
-export CMAKE_TOOLCHAIN_FILE="${1:-/opt/rpi-arm64.toolchain.cmake}"
+# Default the source format when the project ships none — like the changelog,
+# it is synthesised into the private build tree, never onto the project on disk.
+if [ ! -f debian/source/format ]; then
+    mkdir -p debian/source
+    printf '3.0 (native)\n' > debian/source/format
+fi
 
-cat "$SYSROOT"/var/lib/dpkg/info/*.shlibs > debian/shlibs.local
+# Toolchain file: explicit arg wins, then the env from `dbs`, then arm64.
+export CMAKE_TOOLCHAIN_FILE="${1:-${CMAKE_TOOLCHAIN_FILE:-/opt/rpi-arm64.toolchain.cmake}}"
 
-export LD_LIBRARY_PATH="$SYSROOT/usr/lib/aarch64-linux-gnu:$SYSROOT/lib/aarch64-linux-gnu:$SYSROOT/usr/lib"
+cat "$SYSROOT"/var/lib/dpkg/info/*.shlibs > debian/shlibs.local 2>/dev/null || true
 
-DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch arm64
+export LD_LIBRARY_PATH="$SYSROOT/usr/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/usr/lib"
 
-cp ../*.deb "$WORKSPACE"/
+DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch "$DEB_HOST_ARCH"
+
+# Sort artifacts into out/<dist>/<arch>/ inside the workspace.
+OUTDIR="$WORKSPACE/out/$DBS_DIST/$DEB_HOST_ARCH"
+mkdir -p "$OUTDIR"
+cp ../*.deb "$OUTDIR"/
+echo "dbs: packages in out/$DBS_DIST/$DEB_HOST_ARCH/" >&2
+ls -1 "$OUTDIR"

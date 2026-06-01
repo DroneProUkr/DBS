@@ -2,20 +2,140 @@
 set -euo pipefail
 
 BUILDER_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+
+usage() {
+    cat >&2 <<'EOF'
+dbs — Drone Build System
+
+Usage:
+  dbs init [DIR]                      Scaffold a minimal buildable debian/ in DIR
+                                      (default: current directory). Package name
+                                      is the directory's basename. No changelog —
+                                      dbs synthesises one from git at build time.
+
+  dbs [PROJECT_DIR] [options] [-- docker-build-args]
+                                      Cross-build PROJECT_DIR (default: current
+                                      directory). Packages land in
+                                      PROJECT_DIR/out/<dist>/<arch>/.
+
+Build options:
+  --dist bookworm|trixie   Target Debian suite           (default: trixie)
+  --arch 32|64             Target ARM word size           (default: 64)
+                           32 -> armhf, 64 -> arm64
+  -h, --help               Show this help
+EOF
+}
+
+# --------------------------------------------------------------------------
+# dbs init — scaffold a minimal, buildable debian/ directory
+# --------------------------------------------------------------------------
+cmd_init() {
+    local target="$PWD"
+    if [ "${1:-}" != "" ]; then
+        target="$1"
+    fi
+    target="$(cd -- "$target" && pwd)"
+
+    local name pkg
+    name="$(basename -- "$target")"
+    # Debian source/binary package names must be lowercase and match
+    # [a-z0-9][a-z0-9+.-]+ — sanitise the directory name into that shape.
+    pkg="$(printf '%s' "$name" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9+.-]+/-/g; s/^[-+.]+//; s/[-+.]+$//')"
+    [ -z "$pkg" ] && pkg="package"
+    if [ "$pkg" != "$name" ]; then
+        echo "dbs init: package name '$pkg' (sanitised from directory '$name')" >&2
+    fi
+
+    if [ -e "$target/debian" ]; then
+        echo "dbs init: '$target/debian' already exists — refusing to overwrite" >&2
+        exit 1
+    fi
+
+    mkdir -p "$target/debian"
+
+    cat > "$target/debian/control" <<EOF
+Source: $pkg
+Section: misc
+Priority: optional
+Maintainer: special-delivery <development@special-delivery.org>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+
+Package: $pkg
+Architecture: any
+Depends: \${misc:Depends},
+         \${shlibs:Depends}
+Description: $pkg
+ $pkg Debian package built with dbs.
+ .
+ Edit debian/control to describe this package and add its Build-Depends.
+EOF
+
+    # debian/rules — the tab before `dh` is required by make.
+    printf '#!/usr/bin/make -f\n\n%%:\n\tdh $@\n' > "$target/debian/rules"
+    chmod +x "$target/debian/rules"
+
+    # No debian/source/format — dbs defaults it to `3.0 (native)` at build
+    # time (like debian/changelog), leaving the project tree minimal.
+
+    echo "dbs init: created debian/ for package '$pkg' in $target" >&2
+    echo "dbs init: build it with 'dbs' (from $target)" >&2
+}
+
+# --------------------------------------------------------------------------
+# subcommand dispatch
+# --------------------------------------------------------------------------
+case "${1:-}" in
+    init)        shift; cmd_init "$@"; exit 0 ;;
+    -h|--help)   usage; exit 0 ;;
+esac
+
+# --------------------------------------------------------------------------
+# build
+# --------------------------------------------------------------------------
+DIST="trixie"
+ARCH="64"
 PROJECT_DIR="$PWD"
+DOCKER_ARGS=()
+project_set=0
 
-# First non-option argument is the project to build; default to the caller's CWD.
-if [ "${1:-}" != "" ] && [ "${1:-}" != "--" ]; then
-    PROJECT_DIR="$1"
-    shift
-fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dist)    DIST="${2:-}";    shift 2 ;;
+        --dist=*)  DIST="${1#*=}";   shift ;;
+        --arch)    ARCH="${2:-}";    shift 2 ;;
+        --arch=*)  ARCH="${1#*=}";   shift ;;
+        -h|--help) usage; exit 0 ;;
+        --)        shift; DOCKER_ARGS+=("$@"); break ;;
+        *)
+            if [ "$project_set" -eq 0 ]; then
+                PROJECT_DIR="$1"; project_set=1; shift
+            else
+                DOCKER_ARGS+=("$1"); shift
+            fi
+            ;;
+    esac
+done
 
-# Drop an optional "--" separator before extra docker build args.
-[ "${1:-}" = "--" ] && shift
+case "$DIST" in
+    bookworm|trixie) ;;
+    *) echo "dbs: --dist must be 'bookworm' or 'trixie' (got '$DIST')" >&2; exit 1 ;;
+esac
+
+case "$ARCH" in
+    64) DEB_ARCH="arm64"; GNU="aarch64-linux-gnu"; PLATFORM="linux/arm64"
+        TOOLCHAIN="rpi-arm64.toolchain.cmake"; CROSS="crossbuild-essential-arm64" ;;
+    32) DEB_ARCH="armhf"; GNU="arm-linux-gnueabihf"; PLATFORM="linux/arm/v7"
+        TOOLCHAIN="rpi-armhf.toolchain.cmake"; CROSS="crossbuild-essential-armhf" ;;
+    *)  echo "dbs: --arch must be '32' or '64' (got '$ARCH')" >&2; exit 1 ;;
+esac
 
 PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd)"
 if [ ! -f "$PROJECT_DIR/debian/control" ]; then
     echo "dbs: '$PROJECT_DIR' has no debian/control — not a buildable project" >&2
+    echo "dbs: run 'dbs init' there first" >&2
     exit 1
 fi
 
@@ -24,7 +144,9 @@ trap 'rm -rf "$CTX"' EXIT
 cp "$BUILDER_DIR/Dockerfile" \
    "$BUILDER_DIR/crossbuild" \
    "$BUILDER_DIR/aarch64-linux-gnu-pkg-config" \
+   "$BUILDER_DIR/arm-linux-gnueabihf-pkg-config" \
    "$BUILDER_DIR/rpi-arm64.toolchain.cmake" \
+   "$BUILDER_DIR/rpi-armhf.toolchain.cmake" \
    "$CTX/"
 mkdir -p "$CTX/debian"
 cp "$PROJECT_DIR/debian/control" "$CTX/debian/control"
@@ -37,8 +159,22 @@ if [ ! -f "$PROJECT_DIR/debian/changelog" ]; then
     echo "dbs: generated $(head -n1 "$GEN_CL")" >&2
 fi
 
-docker build --progress=plain "$@" --platform linux/amd64 -t rpi64-builder "$CTX"
+TAG="dbs-builder:${DIST}-${DEB_ARCH}"
+echo "dbs: building $DEB_ARCH ($DIST) -> out/$DIST/$DEB_ARCH/" >&2
 
-run_args=(--rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace")
+docker build --progress=plain "${DOCKER_ARGS[@]}" \
+    --platform linux/amd64 \
+    --iidfile "$CTX/iid" \
+    --build-arg "SUITE=$DIST" \
+    --build-arg "SYSROOT_PLATFORM=$PLATFORM" \
+    --build-arg "CROSS_PKG=$CROSS" \
+    -t "$TAG" "$CTX"
+IMAGE_ID="$(cat "$CTX/iid")"
+
+run_args=(--rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace"
+          -e "DBS_DIST=$DIST"
+          -e "DEB_HOST_ARCH=$DEB_ARCH"
+          -e "DEB_HOST_GNU_TYPE=$GNU"
+          -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
-docker run "${run_args[@]}" rpi64-builder
+docker run "${run_args[@]}" "$IMAGE_ID"
