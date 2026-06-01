@@ -19,10 +19,13 @@ Usage:
                                       PROJECT_DIR/out/<dist>/<arch>/.
 
 Build options:
-  --dist bookworm|trixie   Target Debian suite           (default: trixie)
-  --arch 32|64             Target ARM word size           (default: 64)
-                           32 -> armhf, 64 -> arm64
-  -h, --help               Show this help
+  -d, --dist bookworm|trixie   Target Debian suite        (default: trixie)
+  -a, --arch 32|64             Target ARM word size        (default: 64)
+                               32 -> armhf, 64 -> arm64
+  -l, --local                  Emit raw build artifacts into
+                               PROJECT_DIR/build/<dist>/<arch>/ instead of
+                               .deb packages in out/<dist>/<arch>/
+  -h, --help                   Show this help
 EOF
 }
 
@@ -89,16 +92,18 @@ esac
 # --------------------------------------------------------------------------
 DIST="trixie"
 ARCH="64"
+LOCAL=0
 PROJECT_DIR="$PWD"
 DOCKER_ARGS=()
 project_set=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dist)    DIST="${2:-}";    shift 2 ;;
-        --dist=*)  DIST="${1#*=}";   shift ;;
-        --arch)    ARCH="${2:-}";    shift 2 ;;
-        --arch=*)  ARCH="${1#*=}";   shift ;;
+        --dist|-d)     DIST="${2:-}";    shift 2 ;;
+        --dist=*|-d=*) DIST="${1#*=}";   shift ;;
+        --arch|-a)     ARCH="${2:-}";    shift 2 ;;
+        --arch=*|-a=*) ARCH="${1#*=}";   shift ;;
+        --local|-l)    LOCAL=1;          shift ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; DOCKER_ARGS+=("$@"); break ;;
         *)
@@ -152,7 +157,11 @@ if [ ! -f "$PROJECT_DIR/debian/changelog" ]; then
 fi
 
 TAG="dbs-builder:${DIST}-${DEB_ARCH}"
-echo "dbs: building $DEB_ARCH ($DIST) -> out/$DIST/$DEB_ARCH/" >&2
+if [ "$LOCAL" -eq 1 ]; then
+    echo "dbs: building $DEB_ARCH ($DIST) -> build/$DIST/$DEB_ARCH/ (local artifacts)" >&2
+else
+    echo "dbs: building $DEB_ARCH ($DIST) -> out/$DIST/$DEB_ARCH/" >&2
+fi
 
 docker build --progress=plain "${DOCKER_ARGS[@]}" \
     --platform linux/amd64 \
@@ -170,5 +179,6 @@ run_args=(--rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace"
           -e "DBS_HOST_UID=$(id -u)"
           -e "DBS_HOST_GID=$(id -g)"
           -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
+[ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 docker run "${run_args[@]}" "$IMAGE_ID"

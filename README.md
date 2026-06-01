@@ -17,7 +17,7 @@ thing written back is the `out/` directory of finished packages.
   host (amd64)                         docker
   ──────────────────────────────────────────────────────────────────────
   dbs                                  ┌─ sysroot stage (emulated ARM) ──┐
-   ├─ parse --dist / --arch            │  debian:<suite> + raspberrypi   │
+   ├─ parse --dist/--arch/--local      │  debian:<suite> + raspberrypi   │
    ├─ synthesise debian/changelog ─────│  + dronerepo apt repos          │
    │   from git (dbs-changelog)        │  mk-build-deps from control     │
    ├─ assemble docker context          └─────────────┬───────────────────┘
@@ -40,7 +40,8 @@ thing written back is the `out/` directory of finished packages.
    files point every lookup at `/sysroot`.
 3. **crossbuild** (the container entrypoint) copies your bind-mounted
    workspace into `/build/src`, runs `dpkg-buildpackage -b --host-arch <arch>`,
-   and drops the resulting `.deb`s into `out/<dist>/<arch>/`.
+   and drops the resulting `.deb`s into `out/<dist>/<arch>/` — or, with
+   `--local`, the raw installed build tree into `build/<dist>/<arch>/`.
 
 ---
 
@@ -118,8 +119,9 @@ Cross-builds `PROJECT_DIR` (default: current directory). It must contain a
 
 | Option | Values | Default | Meaning |
 |---|---|---|---|
-| `--dist` | `bookworm` \| `trixie` | `trixie` | Target Debian suite |
-| `--arch` | `32` \| `64` | `64` | ARM word size — `32` → **armhf**, `64` → **arm64** |
+| `-d`, `--dist` | `bookworm` \| `trixie` | `trixie` | Target Debian suite |
+| `-a`, `--arch` | `32` \| `64` | `64` | ARM word size — `32` → **armhf**, `64` → **arm64** |
+| `-l`, `--local` | | off | Emit the raw build tree into `build/<dist>/<arch>/` instead of `.deb`s into `out/<dist>/<arch>/` |
 | `-h`, `--help` | | | Show usage |
 
 Anything after `--` is forwarded verbatim to `docker build` (e.g.
@@ -131,11 +133,14 @@ Anything after `--` is forwarded verbatim to `docker build` (e.g.
 # arm64 / trixie (the defaults), building the current directory
 dbs
 
-# 32-bit (armhf) for bookworm
-dbs --arch 32 --dist bookworm
+# 32-bit (armhf) for bookworm (short flags)
+dbs -a 32 -d bookworm
 
 # build a project elsewhere
 dbs ~/source/DroneProUkr/libdatachannel
+
+# grab the raw build tree (compiled binaries/libs/headers), no .deb
+dbs --local
 
 # force a clean docker build
 dbs --arch 64 -- --no-cache
@@ -168,6 +173,22 @@ out/bookworm/armhf/libdatachannel_0.24.3_armhf.deb
 ```
 
 `out/` is regenerated per build and is never carried into the package itself.
+
+#### Local artifacts (`--local`)
+
+With `-l` / `--local`, no `.deb` is written. Instead the raw installed build
+tree — the files that *would* go into the package (`usr/bin`, `usr/lib`,
+headers, …) — is handed back under:
+
+```
+PROJECT_DIR/build/<dist>/<arch>/
+```
+
+For a single-binary package the tree lands directly in that directory; when a
+project produces several binary packages, each is kept in its own
+`build/<dist>/<arch>/<pkg>/` subdirectory. The target `build/<dist>/<arch>/` is
+wiped and regenerated on each run. Handy for quickly inspecting or testing the
+compiled output without unpacking a `.deb`.
 
 ---
 
@@ -232,7 +253,7 @@ is generated. Likewise, a missing `debian/source/format` defaults to
 | `dbs-changelog` | Synthesises `debian/changelog` from git history (GitPython). |
 | `dh-stub` | Fake `dh` used by `dbs-changelog` to extract `--sourcedirectory`. |
 | `Dockerfile` | Two-stage sysroot + cross-build image, parameterised by suite/arch. |
-| `crossbuild` | Container entrypoint: runs `dpkg-buildpackage`, sorts `out/`. |
+| `crossbuild` | Container entrypoint: runs `dpkg-buildpackage`, sorts `out/` (or `build/` with `--local`). |
 | `aarch64-linux-gnu-pkg-config`, `arm-linux-gnueabihf-pkg-config` | `pkg-config` wrappers pointing at `/sysroot`. |
 | `rpi-arm64.toolchain.cmake`, `rpi-armhf.toolchain.cmake` | CMake cross-compile toolchains. |
 

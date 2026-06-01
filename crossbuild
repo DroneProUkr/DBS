@@ -39,16 +39,42 @@ export LD_LIBRARY_PATH="$SYSROOT/usr/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/lib/$DEB_HO
 
 DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch "$DEB_HOST_ARCH"
 
-# Sort artifacts into out/<dist>/<arch>/ inside the workspace.
-OUTDIR="$WORKSPACE/out/$DBS_DIST/$DEB_HOST_ARCH"
-mkdir -p "$OUTDIR"
-cp ../*.deb "$OUTDIR"/
-echo "dbs: packages in out/$DBS_DIST/$DEB_HOST_ARCH/" >&2
-ls -1 "$OUTDIR"
+if [ -n "${DBS_LOCAL:-}" ]; then
+    # Local mode: emit the raw installed build tree instead of .deb packages.
+    # dpkg-buildpackage leaves each binary package's staged files under
+    # debian/<pkg>/; hand those back as build/<dist>/<arch>/.
+    OUTROOT="$WORKSPACE/build"
+    OUTDIR="$OUTROOT/$DBS_DIST/$DEB_HOST_ARCH"
+    rm -rf "$OUTDIR"
+    mkdir -p "$OUTDIR"
+    pkgs=()
+    while IFS= read -r p; do [ -n "$p" ] && pkgs+=("$p"); done < <(dh_listpackages)
+    if [ "${#pkgs[@]}" -eq 1 ] && [ -d "debian/${pkgs[0]}" ]; then
+        # Single binary package — drop its tree straight into the arch dir.
+        cp -a "debian/${pkgs[0]}/." "$OUTDIR"/
+    else
+        # Multiple packages — keep them separated by package name.
+        for p in "${pkgs[@]}"; do
+            [ -d "debian/$p" ] || continue
+            mkdir -p "$OUTDIR/$p"
+            cp -a "debian/$p/." "$OUTDIR/$p"/
+        done
+    fi
+    echo "dbs: build artifacts in build/$DBS_DIST/$DEB_HOST_ARCH/" >&2
+    ls -1 "$OUTDIR"
+else
+    # Sort artifacts into out/<dist>/<arch>/ inside the workspace.
+    OUTROOT="$WORKSPACE/out"
+    OUTDIR="$OUTROOT/$DBS_DIST/$DEB_HOST_ARCH"
+    mkdir -p "$OUTDIR"
+    cp ../*.deb "$OUTDIR"/
+    echo "dbs: packages in out/$DBS_DIST/$DEB_HOST_ARCH/" >&2
+    ls -1 "$OUTDIR"
+fi
 
 # The container runs as root, so artifacts written into the bind-mounted
-# workspace land owned by root on the host. Hand the out/ tree back to the
+# workspace land owned by root on the host. Hand the output tree back to the
 # invoking user (UID/GID passed in by `dbs`).
 if [ -n "${DBS_HOST_UID:-}" ]; then
-    chown -R "$DBS_HOST_UID:${DBS_HOST_GID:-$DBS_HOST_UID}" "$WORKSPACE/out"
+    chown -R "$DBS_HOST_UID:${DBS_HOST_GID:-$DBS_HOST_UID}" "$OUTROOT"
 fi
