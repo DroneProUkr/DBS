@@ -47,7 +47,14 @@ COPY aarch64-linux-gnu-pkg-config /usr/bin/aarch64-linux-gnu-pkg-config
 COPY arm-linux-gnueabihf-pkg-config /usr/bin/arm-linux-gnueabihf-pkg-config
 
 COPY --from=sysroot / /sysroot
-RUN symlinks -cr /sysroot >/dev/null 2>&1 || true
+RUN symlinks -cr /sysroot >/dev/null 2>&1 || true; \
+    find /sysroot -type l | while read -r l; do \
+        t="$(readlink "$l")"; \
+        case "$t" in \
+            /sysroot/*) : ;; \
+            /*) ln -sfn "/sysroot$t" "$l" ;; \
+        esac; \
+    done
 
 COPY rpi-arm64.toolchain.cmake /opt/rpi-arm64.toolchain.cmake
 COPY rpi-armhf.toolchain.cmake /opt/rpi-armhf.toolchain.cmake

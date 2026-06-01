@@ -175,6 +175,8 @@ run_args=(--rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace"
           -e "DBS_DIST=$DIST"
           -e "DEB_HOST_ARCH=$DEB_ARCH"
           -e "DEB_HOST_GNU_TYPE=$GNU"
+          -e "DBS_HOST_UID=$(id -u)"
+          -e "DBS_HOST_GID=$(id -g)"
           -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 docker run "${run_args[@]}" "$IMAGE_ID"

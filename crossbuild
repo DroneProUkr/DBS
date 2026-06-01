@@ -45,3 +45,10 @@ mkdir -p "$OUTDIR"
 cp ../*.deb "$OUTDIR"/
 echo "dbs: packages in out/$DBS_DIST/$DEB_HOST_ARCH/" >&2
 ls -1 "$OUTDIR"
+
+# The container runs as root, so artifacts written into the bind-mounted
+# workspace land owned by root on the host. Hand the out/ tree back to the
+# invoking user (UID/GID passed in by `dbs`).
+if [ -n "${DBS_HOST_UID:-}" ]; then
+    chown -R "$DBS_HOST_UID:${DBS_HOST_GID:-$DBS_HOST_UID}" "$WORKSPACE/out"
+fi
