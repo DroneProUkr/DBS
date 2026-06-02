@@ -2,14 +2,16 @@ Source: @PKG@
 Section: misc
 Priority: optional
 Maintainer: special-delivery <development@special-delivery.org>
-Build-Depends: debhelper-compat (= 13)
+Build-Depends:
+ debhelper-compat (= 13),
 Standards-Version: 4.6.0
 X-Style: black
 
 Package: @PKG@
 Architecture: any
-Depends: ${misc:Depends},
-         ${shlibs:Depends}
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
 Description: @PKG@
  @PKG@ Debian package built with dbs.
  .
