@@ -213,6 +213,7 @@ else
 fi
 
 build_args=(--build-arg "SUITE=$DIST" --build-arg "SYSROOT_PLATFORM=$PLATFORM" \
+            --build-arg "DEB_ARCH=$DEB_ARCH" \
             --build-arg "HOST_DEPS=$HOST_DEPS")
 if [ "$NATIVE" -eq 0 ]; then
     build_args+=(--build-arg "CROSS_PKG=$CROSS")

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Parameterised by `dbs`:
 #   SUITE            debian suite to target   (bookworm | trixie)
 #   SYSROOT_PLATFORM emulated platform of the target sysroot (linux/arm64 | linux/arm/v7)
@@ -7,26 +8,40 @@ ARG SYSROOT_PLATFORM=linux/arm64
 
 FROM --platform=${SYSROOT_PLATFORM} debian:${SUITE} AS sysroot
 ARG SUITE
+ARG DEB_ARCH=arm64
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Keep apt's downloaded .deb archives and indices so the BuildKit cache mounts
+# below survive across builds. debian:* ships /etc/apt/apt.conf.d/docker-clean,
+# whose DPkg::Post-Invoke runs `apt-get clean` after every install and would
+# wipe the very cache we are trying to populate; drop it and tell apt to keep
+# the archives instead. Inherited by the `native` stage (FROM sysroot).
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+        > /etc/apt/apt.conf.d/keep-cache
+
 RUN echo "deb [trusted=yes] http://archive.raspberrypi.com/debian/ ${SUITE} main" > /etc/apt/sources.list.d/raspi.list
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends raspberrypi-archive-keyring && \
- rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends raspberrypi-archive-keyring
 RUN echo "deb http://archive.raspberrypi.com/debian/ ${SUITE} main" > /etc/apt/sources.list.d/raspi.list
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     devscripts \
     equivs \
-    curl \
- && rm -rf /var/lib/apt/lists/*
+    curl
 
 RUN curl -fsSL https://zarcsis.github.io/dronerepo/repo.key | tee /etc/apt/trusted.gpg.d/dronerepo.asc
 RUN echo "deb https://zarcsis.github.io/dronerepo/ ${SUITE} main" > /etc/apt/sources.list.d/dronerepo.list
 
 WORKDIR /workspace
 COPY debian/control debian/control
-RUN apt-get update && mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
+    apt-get update && mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
 
 FROM debian:${SUITE} AS cross
 ARG SUITE
@@ -35,7 +50,16 @@ ARG CROSS_PKG=crossbuild-essential-arm64
 ARG HOST_DEPS=
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# See the sysroot stage: keep apt's download cache so the mounts below persist.
+# The build host is amd64, so these archives are namespaced '-buildhost', kept
+# apart from the arm64/armhf target archives populated by sysroot/native.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
+        > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-buildhost,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-buildhost,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     ${CROSS_PKG} \
     cmake \
     debhelper \
@@ -44,8 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     equivs \
     ninja-build \
     pkgconf \
-    symlinks \
- && rm -rf /var/lib/apt/lists/*
+    symlinks
 
 COPY aarch64-linux-gnu-pkg-config /usr/bin/aarch64-linux-gnu-pkg-config
 COPY arm-linux-gnueabihf-pkg-config /usr/bin/arm-linux-gnueabihf-pkg-config
@@ -66,7 +89,9 @@ COPY crossbuild /usr/bin/crossbuild
 
 COPY dbs-host-deps /usr/local/bin/dbs-host-deps
 COPY debian/control /tmp/control
-RUN apt-get update && \
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-buildhost,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-buildhost,sharing=locked \
+    apt-get update && \
     host_deps="$(dbs-host-deps /tmp/control)" && \
     echo "dbs: auto host tooling : ${host_deps:-<none>}" && \
     echo "dbs: extra host tooling: ${HOST_DEPS:-<none>}" && \
@@ -85,7 +110,7 @@ RUN apt-get update && \
     if [ -n "$host_deps$HOST_DEPS" ]; then \
         apt-get install -y --no-install-recommends $host_deps $HOST_DEPS; \
     fi && \
-    rm -rf /var/lib/apt/lists/* /tmp/control
+    rm -f /tmp/control
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/crossbuild"]
@@ -94,26 +119,32 @@ ENTRYPOINT ["/usr/bin/crossbuild"]
 # Native build target  (dbs --native)
 # --------------------------------------------------------------------------
 FROM sysroot AS native
+# Re-declared for the cache-mount ids below; ARGs do not cross a FROM boundary.
+# The native target installs target-arch packages, so it shares sysroot's cache.
+ARG SUITE
+ARG DEB_ARCH=arm64
 ARG HOST_DEPS=
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     debhelper \
     dpkg-dev \
     ninja-build \
-    pkgconf \
- && rm -rf /var/lib/apt/lists/*
+    pkgconf
 
-RUN if [ -n "$HOST_DEPS" ]; then \
+RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
+    if [ -n "$HOST_DEPS" ]; then \
         apt-get update && \
         names="$(apt-cache pkgnames)" && \
         for p in $HOST_DEPS; do \
             printf '%s\n' "$names" | grep -Fxq "$p" || \
                 { echo "dbs: host-dep '$p' is not a package in the target archives (Debian/Pi/dronerepo)" >&2; exit 1; }; \
         done && \
-        apt-get install -y --no-install-recommends $HOST_DEPS && \
-        rm -rf /var/lib/apt/lists/*; \
+        apt-get install -y --no-install-recommends $HOST_DEPS; \
     fi
 
 COPY crossbuild /usr/bin/crossbuild
