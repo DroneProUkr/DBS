@@ -30,14 +30,24 @@ if [ ! -f debian/source/format ]; then
     printf '3.0 (native)\n' > debian/source/format
 fi
 
-# Toolchain file: explicit arg wins, then the env from `dbs`, then arm64.
-export CMAKE_TOOLCHAIN_FILE="${1:-${CMAKE_TOOLCHAIN_FILE:-/opt/rpi-arm64.toolchain.cmake}}"
+if [ -n "${DBS_NATIVE:-}" ]; then
+    # Native mode (dbs --native): this container already runs the target
+    # architecture under QEMU, so there is no sysroot, cross toolchain, or
+    # --host-arch — build in place exactly as the package would on real
+    # hardware. Slower, but sidesteps every cross-compilation quirk (Python/Java
+    # bindings, cmake configs that bake in absolute /usr paths, etc.).
+    DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b
+else
+    # Cross mode: point the build at the target sysroot and cross toolchain.
+    # Toolchain file: explicit arg wins, then the env from `dbs`, then arm64.
+    export CMAKE_TOOLCHAIN_FILE="${1:-${CMAKE_TOOLCHAIN_FILE:-/opt/rpi-arm64.toolchain.cmake}}"
 
-cat "$SYSROOT"/var/lib/dpkg/info/*.shlibs > debian/shlibs.local 2>/dev/null || true
+    cat "$SYSROOT"/var/lib/dpkg/info/*.shlibs > debian/shlibs.local 2>/dev/null || true
 
-export LD_LIBRARY_PATH="$SYSROOT/usr/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/usr/lib"
+    export LD_LIBRARY_PATH="$SYSROOT/usr/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/usr/lib"
 
-DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch "$DEB_HOST_ARCH"
+    DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch "$DEB_HOST_ARCH"
+fi
 
 if [ -n "${DBS_LOCAL:-}" ]; then
     # Local mode: emit the raw installed build tree instead of .deb packages.

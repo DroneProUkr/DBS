@@ -25,6 +25,19 @@ Build options:
   -l, --local                  Emit raw build artifacts into
                                PROJECT_DIR/build/<dist>/<arch>/ instead of
                                .deb packages in out/<dist>/<arch>/
+  -n, --native                 Build natively inside the emulated target-arch
+                               container (QEMU) instead of cross-compiling.
+                               Slower, but builds packages that don't
+                               cross-compile (e.g. opencv's Python/Java
+                               bindings).
+  --host-deps "PKG..."         Extra build packages for build tools the
+                               auto-detection can't classify (e.g.
+                               protobuf-compiler). Repeatable; space-separated.
+                               Cross: installed on the amd64 build host (Debian
+                               main only). Native: installed in the target-arch
+                               container (Debian/Pi/dronerepo). A project may also
+                               list them in debian/dbs-host-deps (one per line,
+                               '#' comments).
   -h, --help                   Show this help
 EOF
 }
@@ -93,17 +106,26 @@ esac
 DIST="trixie"
 ARCH="64"
 LOCAL=0
+NATIVE=0
+HOST_DEPS=""
 PROJECT_DIR="$PWD"
 DOCKER_ARGS=()
 project_set=0
 
+# Abort with a clear message when a value-taking option is given none, instead
+# of letting `shift 2` fail silently (no output) under `set -e`.
+need_val() { [ "$2" -ge 2 ] || { echo "dbs: option '$1' requires a value" >&2; exit 1; }; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dist|-d)     DIST="${2:-}";    shift 2 ;;
+        --dist|-d)     need_val "$1" "$#"; DIST="$2"; shift 2 ;;
         --dist=*|-d=*) DIST="${1#*=}";   shift ;;
-        --arch|-a)     ARCH="${2:-}";    shift 2 ;;
+        --arch|-a)     need_val "$1" "$#"; ARCH="$2"; shift 2 ;;
         --arch=*|-a=*) ARCH="${1#*=}";   shift ;;
         --local|-l)    LOCAL=1;          shift ;;
+        --native|-n)   NATIVE=1;         shift ;;
+        --host-deps)   need_val "$1" "$#"; HOST_DEPS="$HOST_DEPS $2"; shift 2 ;;
+        --host-deps=*) HOST_DEPS="$HOST_DEPS ${1#*=}"; shift ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; DOCKER_ARGS+=("$@"); break ;;
         *)
@@ -136,10 +158,30 @@ if [ ! -f "$PROJECT_DIR/debian/control" ]; then
     exit 1
 fi
 
+host_deps_file="$PROJECT_DIR/debian/dbs-host-deps"
+if [ -f "$host_deps_file" ]; then
+    HOST_DEPS="$(sed 's/#.*//' "$host_deps_file" | tr '\n' ' ') $HOST_DEPS"
+fi
+HOST_DEPS="$(printf '%s' "$HOST_DEPS" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')"
+for dep in $HOST_DEPS; do
+    # Debian binary package names start with [a-z0-9] and then use only
+    # [a-z0-9+.-]. Reject anything else — leading punctuation, ':' multiarch
+    # qualifiers, '~', uppercase, shell metacharacters — so the value matches
+    # its "bare package name" contract and nothing unsafe reaches the unquoted
+    # `apt-get install $HOST_DEPS` in the Dockerfile.
+    case "$dep" in
+        [!a-z0-9]*|*[!a-z0-9+.-]*)
+            echo "dbs: invalid host-dep '$dep' — expected a bare package name" >&2
+            exit 1 ;;
+    esac
+done
+[ -n "$HOST_DEPS" ] && echo "dbs: extra host build tooling: $HOST_DEPS" >&2
+
 CTX="$(mktemp -d)"
 trap 'rm -rf "$CTX"' EXIT
 cp "$BUILDER_DIR/Dockerfile" \
    "$BUILDER_DIR/crossbuild" \
+   "$BUILDER_DIR/dbs-host-deps" \
    "$BUILDER_DIR/aarch64-linux-gnu-pkg-config" \
    "$BUILDER_DIR/arm-linux-gnueabihf-pkg-config" \
    "$BUILDER_DIR/rpi-arm64.toolchain.cmake" \
@@ -156,29 +198,45 @@ if [ ! -f "$PROJECT_DIR/debian/changelog" ]; then
     echo "dbs: generated $(head -n1 "$GEN_CL")" >&2
 fi
 
-TAG="dbs-builder:${DIST}-${DEB_ARCH}"
-if [ "$LOCAL" -eq 1 ]; then
-    echo "dbs: building $DEB_ARCH ($DIST) -> build/$DIST/$DEB_ARCH/ (local artifacts)" >&2
+if [ "$NATIVE" -eq 1 ]; then
+    TARGET="native"; BUILD_PLATFORM="$PLATFORM"; TAG="dbs-builder:${DIST}-${DEB_ARCH}-native"
+    mode_note=" (native/QEMU)"
 else
-    echo "dbs: building $DEB_ARCH ($DIST) -> out/$DIST/$DEB_ARCH/" >&2
+    TARGET="cross";  BUILD_PLATFORM="linux/amd64"; TAG="dbs-builder:${DIST}-${DEB_ARCH}"
+    mode_note=""
+fi
+
+if [ "$LOCAL" -eq 1 ]; then
+    echo "dbs: building $DEB_ARCH ($DIST)$mode_note -> build/$DIST/$DEB_ARCH/ (local artifacts)" >&2
+else
+    echo "dbs: building $DEB_ARCH ($DIST)$mode_note -> out/$DIST/$DEB_ARCH/" >&2
+fi
+
+build_args=(--build-arg "SUITE=$DIST" --build-arg "SYSROOT_PLATFORM=$PLATFORM" \
+            --build-arg "HOST_DEPS=$HOST_DEPS")
+if [ "$NATIVE" -eq 0 ]; then
+    build_args+=(--build-arg "CROSS_PKG=$CROSS")
 fi
 
 docker build --progress=plain "${DOCKER_ARGS[@]}" \
-    --platform linux/amd64 \
+    --platform "$BUILD_PLATFORM" \
+    --target "$TARGET" \
     --iidfile "$CTX/iid" \
-    --build-arg "SUITE=$DIST" \
-    --build-arg "SYSROOT_PLATFORM=$PLATFORM" \
-    --build-arg "CROSS_PKG=$CROSS" \
+    "${build_args[@]}" \
     -t "$TAG" "$CTX"
 IMAGE_ID="$(cat "$CTX/iid")"
 
-run_args=(--rm --platform linux/amd64 -v "$PROJECT_DIR:/workspace"
+run_args=(--rm --platform "$BUILD_PLATFORM" -v "$PROJECT_DIR:/workspace"
           -e "DBS_DIST=$DIST"
           -e "DEB_HOST_ARCH=$DEB_ARCH"
-          -e "DEB_HOST_GNU_TYPE=$GNU"
           -e "DBS_HOST_UID=$(id -u)"
-          -e "DBS_HOST_GID=$(id -g)"
-          -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
+          -e "DBS_HOST_GID=$(id -g)")
+if [ "$NATIVE" -eq 1 ]; then
+    run_args+=(-e "DBS_NATIVE=1")
+else
+    run_args+=(-e "DEB_HOST_GNU_TYPE=$GNU"
+               -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
+fi
 [ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 docker run "${run_args[@]}" "$IMAGE_ID"

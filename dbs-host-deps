@@ -1,0 +1,61 @@
+#!/bin/bash
+# dbs-host-deps — print the build-dependencies that must be installed on the
+# *build host* (amd64) rather than inside the cross sysroot.
+#
+# In a cross build, dpkg-buildpackage/dh and the helpers they invoke run
+# natively on the build machine, while the target libraries live in /sysroot.
+# Therefore:
+#   * Architecture-independent build-deps — dh add-on sequences
+#     (dh-sequence-javahelper, dh-sequence-python3, …), perl/python helpers and
+#     other "Architecture: all" tools — are executables the build runs on the
+#     host and MUST be present there.
+#   * Architecture-dependent -dev libraries belong to the sysroot and must NOT
+#     be installed on the host (they are the wrong arch, and several of ours —
+#     e.g. the dronerepo libs — aren't published for amd64 at all).
+#
+# Selection rule: keep a build-dep when it is a dh-sequence-* add-on (always
+# Architecture: all, but a virtual package apt-cache cannot describe) or when
+# its real package is "Architecture: all". Everything else is left to the
+# sysroot. Output is a space/newline-separated package list on stdout.
+#
+# Requires (in the build container): devscripts (mk-build-deps), equivs, apt.
+set -euo pipefail
+
+control="${1:-debian/control}"
+if [ ! -f "$control" ]; then
+    echo "dbs-host-deps: no such control file: $control" >&2
+    exit 1
+fi
+
+# Resolve Build-Depends + Build-Depends-Indep for the build (host) architecture
+# into a flat dependency line, letting mk-build-deps handle continuation lines
+# and [arch]/<profile> restrictions instead of re-implementing that parser.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+install -D "$control" "$work/debian/control"
+( cd "$work" && mk-build-deps debian/control >/dev/null 2>&1 )
+
+depends="$(dpkg-deb -f "$work"/*-build-deps_*.deb Depends 2>/dev/null || true)"
+[ -n "$depends" ] || exit 0
+
+sel=()
+IFS=','
+for tok in $depends; do
+    # First alternative only; drop version (...) / arch [...] / profile <...>
+    # qualifiers and surrounding whitespace, leaving a bare package name.
+    pkg="${tok%%|*}"
+    pkg="$(printf '%s' "$pkg" | sed -E 's/\([^)]*\)//g; s/\[[^]]*\]//g; s/<[^>]*>//g; s/[[:space:]]//g')"
+    [ -n "$pkg" ] || continue
+    case "$pkg" in
+        dh-sequence-*)
+            sel+=("$pkg") ;;
+        *)
+            if apt-cache show "$pkg" 2>/dev/null | grep -qx 'Architecture: all'; then
+                sel+=("$pkg")
+            fi ;;
+    esac
+done
+unset IFS
+
+[ "${#sel[@]}" -gt 0 ] && printf '%s\n' "${sel[@]}"
+exit 0

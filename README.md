@@ -37,11 +37,28 @@ thing written back is the `out/` directory of finished packages.
 2. **Build stage** — a native amd64 image holding the cross-compilers
    (`crossbuild-essential-arm64` / `-armhf`), CMake, debhelper and the sysroot
    copied from stage 1. Cross-aware `pkg-config` wrappers and CMake toolchain
-   files point every lookup at `/sysroot`.
+   files point every lookup at `/sysroot`. The build-time *tooling* from your
+   `Build-Depends` is also installed here natively (`dbs-host-deps`): dh add-on
+   sequences (`dh-sequence-*`, e.g. `javahelper`/`python3`) and any
+   `Architecture: all` helper run on this host during the build, so they must
+   live here rather than only in the (wrong-arch) sysroot.
 3. **crossbuild** (the container entrypoint) copies your bind-mounted
    workspace into `/build/src`, runs `dpkg-buildpackage -b --host-arch <arch>`,
    and drops the resulting `.deb`s into `out/<dist>/<arch>/` — or, with
    `--local`, the raw installed build tree into `build/<dist>/<arch>/`.
+
+### Native mode (`--native`)
+
+Some packages don't cross-compile — typically those that build language
+bindings (e.g. opencv's Python bindings run the host's `python`, which is the
+wrong architecture) or pull in cmake package configs that bake in absolute
+`/usr` paths. For these, `--native` skips the cross stage entirely: it adds a
+native toolchain to the **sysroot** stage (which already has your
+`Build-Depends`) and runs `dpkg-buildpackage -b` *inside* the emulated
+target-arch container under QEMU. Everything — compilers, `python`, the JDK — is
+already the target architecture, so there are no cross-compilation quirks. The
+trade-off is speed: the whole compile runs under emulation. The `sysroot` stage
+is shared with cross builds, so switching modes doesn't rebuild it.
 
 ---
 
@@ -122,6 +139,8 @@ Cross-builds `PROJECT_DIR` (default: current directory). It must contain a
 | `-d`, `--dist` | `bookworm` \| `trixie` | `trixie` | Target Debian suite |
 | `-a`, `--arch` | `32` \| `64` | `64` | ARM word size — `32` → **armhf**, `64` → **arm64** |
 | `-l`, `--local` | | off | Emit the raw build tree into `build/<dist>/<arch>/` instead of `.deb`s into `out/<dist>/<arch>/` |
+| `-n`, `--native` | | off | Build **natively** inside the emulated target-arch container (QEMU) instead of cross-compiling. Slower, but builds packages that don't cross-compile. |
+| `--host-deps` | `"PKG..."` | none | Extra build packages to install for the build (repeatable; also via `debian/dbs-host-deps`). Cross: on the amd64 host (Debian main only). Native: in the target container (Debian/Pi/dronerepo). |
 | `-h`, `--help` | | | Show usage |
 
 Anything after `--` is forwarded verbatim to `docker build` (e.g.
@@ -198,9 +217,12 @@ A buildable project provides a standard Debian `debian/` directory. The key
 fields `dbs` cares about:
 
 - **`debian/control`** — `Source:` (package name), `Maintainer:` (used as the
-  changelog author when no git author is available) and `Build-Depends:`
-  (installed into the sysroot). These dependencies are resolved from the
-  Debian, Raspberry Pi and dronerepo archives.
+  changelog author when no git author is available) and `Build-Depends:`.
+  Architecture-dependent `-dev` libraries are installed into the sysroot for the
+  target arch; architecture-independent build *tooling* (dh add-on sequences,
+  `Architecture: all` helpers) is installed natively on the build host so `dh`
+  can run it. These dependencies are resolved from the Debian, Raspberry Pi and
+  dronerepo archives.
 - **`debian/rules`** — a debhelper rules file. If the upstream source lives in
   a subdirectory (commonly a git **submodule**), point debhelper at it with
   `--sourcedirectory`; `dbs` reads the same option to know which git tree to
@@ -211,6 +233,20 @@ fields `dbs` cares about:
   %:
   	dh $@ --buildsystem=cmake --sourcedirectory=libdatachannel
   ```
+
+- **`debian/dbs-host-deps`** *(optional)* — extra build utilities that the
+  host-tooling auto-detection can't classify, because they are arch-dependent
+  tools rather than `Architecture: all` helpers (e.g. `protobuf-compiler`,
+  `astyle`). One package per line; `#` starts a comment. The same list can be
+  passed ad-hoc with `--host-deps "PKG..."` (handy when you must keep a
+  project's `debian/` pristine). In **cross** builds these install on the amd64
+  build host, which carries only the Debian archive — so they must be packages
+  available in Debian **main** (the raspi/dronerepo repos exist only in the
+  sysroot stage). In **native** builds (`-n`) they install inside the
+  target-arch container instead, which also has the Raspberry Pi and dronerepo
+  archives. Each entry must be an **exact** package name; an unknown name (e.g.
+  a typo) fails the build with a clear error rather than being silently
+  substring-expanded by `apt-get`.
 
 `debian/changelog` and `debian/source/format` are **optional** — see below.
 
@@ -251,8 +287,9 @@ is generated. Likewise, a missing `debian/source/format` defaults to
 |---|---|
 | `dbs` | Host CLI: `init` scaffolding and the build driver. |
 | `dbs-changelog` | Synthesises `debian/changelog` from git history (GitPython). |
+| `dbs-host-deps` | Selects the build-host tooling (`dh-sequence-*` + `Architecture: all` build-deps) to install natively in the build stage. |
 | `dh-stub` | Fake `dh` used by `dbs-changelog` to extract `--sourcedirectory`. |
-| `Dockerfile` | Two-stage sysroot + cross-build image, parameterised by suite/arch. |
+| `Dockerfile` | Multi-stage image (`sysroot` + `cross` + `native` targets), parameterised by suite/arch. |
 | `crossbuild` | Container entrypoint: runs `dpkg-buildpackage`, sorts `out/` (or `build/` with `--local`). |
 | `aarch64-linux-gnu-pkg-config`, `arm-linux-gnueabihf-pkg-config` | `pkg-config` wrappers pointing at `/sysroot`. |
 | `rpi-arm64.toolchain.cmake`, `rpi-armhf.toolchain.cmake` | CMake cross-compile toolchains. |
@@ -266,6 +303,7 @@ is generated. Likewise, a missing `debian/source/format` defaults to
   cache. Add `-- --no-cache` to force a clean rebuild.
 - Builds run with `DEB_BUILD_OPTIONS="noautodbgsym nocheck"` — debug symbol
   packages and test suites are skipped.
-- The build image is tagged `dbs-builder:<dist>-<arch>` and reused across runs.
+- The build image is tagged `dbs-builder:<dist>-<arch>` (or
+  `dbs-builder:<dist>-<arch>-native` with `-n`) and reused across runs.
 - `out/` from a previous run is stripped inside the container before building,
   so a stale output tree is never packaged.

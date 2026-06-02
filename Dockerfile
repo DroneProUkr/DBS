@@ -28,9 +28,11 @@ WORKDIR /workspace
 COPY debian/control debian/control
 RUN apt-get update && mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
 
-FROM debian:${SUITE}
+FROM debian:${SUITE} AS cross
 ARG SUITE
 ARG CROSS_PKG=crossbuild-essential-arm64
+
+ARG HOST_DEPS=
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,6 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     debhelper \
     devscripts \
     dpkg-dev \
+    equivs \
+    ninja-build \
     pkgconf \
     symlinks \
  && rm -rf /var/lib/apt/lists/*
@@ -60,5 +64,58 @@ COPY rpi-arm64.toolchain.cmake /opt/rpi-arm64.toolchain.cmake
 COPY rpi-armhf.toolchain.cmake /opt/rpi-armhf.toolchain.cmake
 COPY crossbuild /usr/bin/crossbuild
 
+COPY dbs-host-deps /usr/local/bin/dbs-host-deps
+COPY debian/control /tmp/control
+RUN apt-get update && \
+    host_deps="$(dbs-host-deps /tmp/control)" && \
+    echo "dbs: auto host tooling : ${host_deps:-<none>}" && \
+    echo "dbs: extra host tooling: ${HOST_DEPS:-<none>}" && \
+    # Reject a user --host-deps that is not an exact package name. apt-get
+    # otherwise treats a name containing '.' as a POSIX regex when no literal
+    # package matches, so a typo like 'protobuf.' silently substring-installs
+    # dozens of unrelated packages instead of failing. dbs validated the token
+    # shape; this validates existence in the archive the deps install from.
+    if [ -n "$HOST_DEPS" ]; then \
+        names="$(apt-cache pkgnames)" && \
+        for p in $HOST_DEPS; do \
+            printf '%s\n' "$names" | grep -Fxq "$p" || \
+                { echo "dbs: host-dep '$p' is not a package in the build-host archive (Debian main)" >&2; exit 1; }; \
+        done; \
+    fi && \
+    if [ -n "$host_deps$HOST_DEPS" ]; then \
+        apt-get install -y --no-install-recommends $host_deps $HOST_DEPS; \
+    fi && \
+    rm -rf /var/lib/apt/lists/* /tmp/control
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/bin/crossbuild"]
+
+# --------------------------------------------------------------------------
+# Native build target  (dbs --native)
+# --------------------------------------------------------------------------
+FROM sysroot AS native
+ARG HOST_DEPS=
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    debhelper \
+    dpkg-dev \
+    ninja-build \
+    pkgconf \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN if [ -n "$HOST_DEPS" ]; then \
+        apt-get update && \
+        names="$(apt-cache pkgnames)" && \
+        for p in $HOST_DEPS; do \
+            printf '%s\n' "$names" | grep -Fxq "$p" || \
+                { echo "dbs: host-dep '$p' is not a package in the target archives (Debian/Pi/dronerepo)" >&2; exit 1; }; \
+        done && \
+        apt-get install -y --no-install-recommends $HOST_DEPS && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+COPY crossbuild /usr/bin/crossbuild
 WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/crossbuild"]
