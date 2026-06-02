@@ -240,4 +240,12 @@ else
 fi
 [ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
+
+# Colourised build output. dpkg-buildpackage -> cmake/ninja/gcc/clang each
+# decide whether to emit ANSI colour from isatty(); a bare `docker run` hands
+# them a pipe, so they go monochrome. When *our own* stdout is a real terminal,
+# allocate a pseudo-TTY for the container so every build tool sees an
+# interactive terminal and colourises (and ninja shows its live status line).
+# When piped/redirected we add nothing, keeping logs free of escape codes.
+[ -t 1 ] && run_args+=(-t)
 docker run "${run_args[@]}" "$IMAGE_ID"

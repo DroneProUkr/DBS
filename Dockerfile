@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},s
     equivs \
     curl
 
-RUN curl -fsSL https://zarcsis.github.io/dronerepo/repo.key | tee /etc/apt/trusted.gpg.d/dronerepo.asc
+RUN curl -fsSL https://zarcsis.github.io/dronerepo/repo.key -o /etc/apt/trusted.gpg.d/dronerepo.asc
 RUN echo "deb https://zarcsis.github.io/dronerepo/ ${SUITE} main" > /etc/apt/sources.list.d/dronerepo.list
 
 WORKDIR /workspace
