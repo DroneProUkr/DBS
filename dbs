@@ -16,7 +16,10 @@ Usage:
   dbs [PROJECT_DIR] [options] [-- docker-build-args]
                                       Cross-build PROJECT_DIR (default: current
                                       directory). Packages land in
-                                      PROJECT_DIR/out/<dist>/<arch>/.
+                                      PROJECT_DIR/out/<dist>/<arch>/. A
+                                      PROJECT_DIR whose name starts with '-'
+                                      must be written as ./name or given
+                                      after --.
 
 Build options:
   -d, --dist bookworm|trixie   Target Debian suite        (default: trixie)
@@ -30,6 +33,10 @@ Build options:
                                Slower, but builds packages that don't
                                cross-compile (e.g. opencv's Python/Java
                                bindings).
+  -p, --publish                Copy the built .deb packages into the local
+                               package repo so other projects can use them as
+                               Build-Depends. Without this, builds stay in
+                               out/<dist>/<arch>/ only.
   --host-deps "PKG..."         Extra build packages for build tools the
                                auto-detection can't classify (e.g.
                                protobuf-compiler). Repeatable; space-separated.
@@ -40,11 +47,15 @@ Build options:
                                '#' comments).
   -h, --help                   Show this help
 
+  Short flags may be bundled: -np is the same as -n -p, and a
+  value-taking flag may end a bundle, so -npa 32 means -n -p -a 32.
+
 Local package repo:
-  Built packages are copied into ~/dbs/localrepo/<dist>/<arch>/ and that
-  directory is exposed to the sysroot as an apt source, so a package built
-  earlier can satisfy another project's Build-Depends. Override the ~/dbs root
-  with the DBS_HOME environment variable.
+  With -p/--publish, built packages are copied into
+  ~/dbs/localrepo/<dist>/<arch>/ and that directory is exposed to the sysroot
+  as an apt source, so a package built earlier can satisfy another project's
+  Build-Depends. Override the ~/dbs root with the DBS_HOME environment
+  variable.
 EOF
 }
 
@@ -113,23 +124,67 @@ DIST="trixie"
 ARCH="64"
 LOCAL=0
 NATIVE=0
+PUBLISH=0
 HOST_DEPS=""
 PROJECT_DIR="$PWD"
 DOCKER_ARGS=()
 project_set=0
 
-# Abort with a clear message when a value-taking option is given none, instead
-# of letting `shift 2` fail silently (no output) under `set -e`.
 need_val() { [ "$2" -ge 2 ] || { echo "dbs: option '$1' requires a value" >&2; exit 1; }; }
+
+expand_short_opts() {
+    EXPANDED=()
+    while [ $# -gt 0 ]; do
+        local arg="$1"; shift
+        case "$arg" in
+            --) EXPANDED+=("$arg" "$@"); return ;;
+            -[!-]?*)
+                local opt="${arg#-}" cluster=() consume="" ok=1 c
+                while [ -n "$opt" ]; do
+                    c="${opt:0:1}"; opt="${opt:1}"
+                    case "$c" in
+                        l|n|p|h) cluster+=("-$c") ;;
+                        d|a)
+                            if [ -n "$opt" ]; then
+                                cluster+=("-$c" "${opt#=}"); opt=""
+                            else
+                                consume="-$c"   # value comes from the next argv token
+                            fi
+                            ;;
+                        *) ok=0; break ;;       # not a clean cluster — leave it alone
+                    esac
+                done
+                if [ "$ok" -eq 0 ]; then
+                    EXPANDED+=("$arg")
+                else
+                    EXPANDED+=(${cluster[@]+"${cluster[@]}"})
+                    if [ -n "$consume" ]; then
+                        if [ $# -gt 0 ] && [ "$1" != "--" ]; then
+                            EXPANDED+=("$consume" "$1"); shift
+                        else
+                            echo "dbs: option '$consume' requires a value" >&2; exit 1
+                        fi
+                    fi
+                fi
+                ;;
+            *) EXPANDED+=("$arg") ;;
+        esac
+    done
+}
+expand_short_opts "$@"
+set -- ${EXPANDED[@]+"${EXPANDED[@]}"}
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        # short -d/-a (incl. -d=val and bundled) are normalised to '-d val' by
+        # expand_short_opts above, so only the long =forms reach these arms.
         --dist|-d)     need_val "$1" "$#"; DIST="$2"; shift 2 ;;
-        --dist=*|-d=*) DIST="${1#*=}";   shift ;;
+        --dist=*)      DIST="${1#*=}";   shift ;;
         --arch|-a)     need_val "$1" "$#"; ARCH="$2"; shift 2 ;;
-        --arch=*|-a=*) ARCH="${1#*=}";   shift ;;
+        --arch=*)      ARCH="${1#*=}";   shift ;;
         --local|-l)    LOCAL=1;          shift ;;
         --native|-n)   NATIVE=1;         shift ;;
+        --publish|-p)  PUBLISH=1;        shift ;;
         --host-deps)   need_val "$1" "$#"; HOST_DEPS="$HOST_DEPS $2"; shift 2 ;;
         --host-deps=*) HOST_DEPS="$HOST_DEPS ${1#*=}"; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -255,7 +310,7 @@ fi
 [ -t 1 ] && run_args+=(-t)
 docker run "${run_args[@]}" "$IMAGE_ID"
 
-if [ "$LOCAL" -eq 0 ]; then
+if [ "$LOCAL" -eq 0 ] && [ "$PUBLISH" -eq 1 ]; then
     out_dir="$PROJECT_DIR/out/$DIST/$DEB_ARCH"
     if compgen -G "$out_dir/*.deb" >/dev/null; then
         mkdir -p "$LOCALREPO"

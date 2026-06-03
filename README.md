@@ -141,11 +141,17 @@ Cross-builds `PROJECT_DIR` (default: current directory). It must contain a
 | `-a`, `--arch` | `32` \| `64` | `64` | ARM word size — `32` → **armhf**, `64` → **arm64** |
 | `-l`, `--local` | | off | Emit the raw build tree into `build/<dist>/<arch>/` instead of `.deb`s into `out/<dist>/<arch>/` |
 | `-n`, `--native` | | off | Build **natively** inside the emulated target-arch container (QEMU) instead of cross-compiling. Slower, but builds packages that don't cross-compile. |
+| `-p`, `--publish` | | off | After a successful build, copy the `.deb`s into the [local package repo](#local-package-repo) so other projects can resolve them as `Build-Depends`. Without it, packages stay in `out/` only. |
 | `--host-deps` | `"PKG..."` | none | Extra build packages to install for the build (repeatable; also via `debian/dbs-host-deps`). Cross: on the amd64 host (Debian main only). Native: in the target container (Debian/Pi/dronerepo). |
 | `-h`, `--help` | | | Show usage |
 
 Anything after `--` is forwarded verbatim to `docker build` (e.g.
 `-- --no-cache`).
+
+Short flags may be **bundled**: `-np` is the same as `-n -p`, and a
+value-taking flag may end a bundle, so `-npa 32` means `-n -p -a 32`. (A
+`PROJECT_DIR` whose name begins with `-` must be written as `./name` or given
+after `--`, so it isn't mistaken for a flag bundle.)
 
 #### Examples
 
@@ -161,6 +167,10 @@ dbs ~/source/DroneProUkr/libdatachannel
 
 # grab the raw build tree (compiled binaries/libs/headers), no .deb
 dbs --local
+
+# build and publish to the local repo so other projects can Build-Depend on it
+dbs --publish
+dbs -np                 # natively, then publish (bundled short flags)
 
 # force a clean docker build
 dbs --arch 64 -- --no-cache
@@ -214,11 +224,16 @@ compiled output without unpacking a `.deb`.
 
 ## Local package repo
 
-Every package `dbs` builds is copied into a local apt repository under your
-home directory, and that repository is added as a source in the **sysroot**
-stage. This lets packages depend on each other: build a library once and a
-later build of something that `Build-Depends` on it resolves it straight from
-your own previous output — no need to publish to dronerepo first.
+`dbs` keeps a local apt repository under your home directory and adds it as a
+source in the **sysroot** stage of *every* build. This lets packages depend on
+each other: build a library, publish it, and a later build of something that
+`Build-Depends` on it resolves it straight from your own previous output — no
+need to publish to dronerepo first.
+
+Reading from the repo is automatic; **writing** to it is opt-in. Pass
+`-p` / `--publish` to copy a build's `.deb`s into the repo. Without it the
+packages stay in `out/<dist>/<arch>/` and nothing is shared with other
+projects.
 
 ```
 ~/dbs/localrepo/<dist>/<arch>/*.deb
@@ -237,8 +252,9 @@ How it works, per build:
    as an apt source for that one `mk-build-deps` invocation. The mount is
    ephemeral — the `.deb` files and the index never enter an image layer, so
    nothing is duplicated into the cross stage's `/sysroot`.
-2. After a successful build, the produced `.deb`s (from `out/<dist>/<arch>/`)
-   are copied into the local repo, ready for the next build.
+2. After a successful build, **only when `-p` / `--publish` is given**, the
+   produced `.deb`s (from `out/<dist>/<arch>/`) are copied into the local repo,
+   ready for the next build. Plain builds leave the repo untouched.
 
 When two sources offer the same package, apt picks the **highest version** as
 usual — a locally built package (whose version `dbs` derives from git) wins
@@ -247,11 +263,11 @@ only when it actually out-versions the archive copy.
 Notes:
 
 - The repo root defaults to `~/dbs`; set **`DBS_HOME`** to relocate it.
-- It starts empty and fills up as you build; nothing special is needed to
-  bootstrap it. Build order still matters — build a dependency *before* the
-  package that needs it.
-- `--local` builds emit a raw build tree rather than `.deb`s, so they publish
-  nothing to the local repo.
+- It starts empty and fills up as you build **with `-p`**; nothing special is
+  needed to bootstrap it. Build order still matters — build and publish a
+  dependency *before* the package that needs it.
+- `--local` builds emit a raw build tree rather than `.deb`s, so there is
+  nothing to publish even with `-p`.
 - It is a plain directory of `.deb` files: delete stale ones by hand, or
   `rm -rf ~/dbs/localrepo` to start over.
 
