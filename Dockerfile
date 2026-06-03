@@ -11,11 +11,6 @@ ARG SUITE
 ARG DEB_ARCH=arm64
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Keep apt's downloaded .deb archives and indices so the BuildKit cache mounts
-# below survive across builds. debian:* ships /etc/apt/apt.conf.d/docker-clean,
-# whose DPkg::Post-Invoke runs `apt-get clean` after every install and would
-# wipe the very cache we are trying to populate; drop it and tell apt to keep
-# the archives instead. Inherited by the `native` stage (FROM sysroot).
 RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
         > /etc/apt/apt.conf.d/keep-cache
@@ -39,9 +34,26 @@ RUN echo "deb https://zarcsis.github.io/dronerepo/ ${SUITE} main" > /etc/apt/sou
 
 WORKDIR /workspace
 COPY debian/control debian/control
+
 RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
     --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
-    apt-get update && mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+    --mount=type=bind,source=localrepo,target=/localrepo,rw \
+    set -e; \
+    if ls /localrepo/*.deb >/dev/null 2>&1; then \
+        echo "dbs: local repo: $(ls /localrepo/*.deb | wc -l) prebuilt package(s)"; \
+        ( cd /localrepo && dpkg-scanpackages --multiversion . > Packages 2>/dev/null ); \
+        sz=$(stat -c%s /localrepo/Packages); \
+        { echo "Date: $(date -uR)"; \
+          echo "MD5Sum:"; \
+          echo " $(md5sum /localrepo/Packages | cut -d' ' -f1) $sz Packages"; \
+          echo "SHA256:"; \
+          echo " $(sha256sum /localrepo/Packages | cut -d' ' -f1) $sz Packages"; \
+        } > /localrepo/Release; \
+        echo "deb [trusted=yes] file:/localrepo ./" > /etc/apt/sources.list.d/dbs-localrepo.list; \
+    fi; \
+    apt-get update && \
+    mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control; \
+    rm -f /etc/apt/sources.list.d/dbs-localrepo.list
 
 FROM debian:${SUITE} AS cross
 ARG SUITE
@@ -50,9 +62,6 @@ ARG CROSS_PKG=crossbuild-essential-arm64
 ARG HOST_DEPS=
 ENV DEBIAN_FRONTEND=noninteractive
 
-# See the sysroot stage: keep apt's download cache so the mounts below persist.
-# The build host is amd64, so these archives are namespaced '-buildhost', kept
-# apart from the arm64/armhf target archives populated by sysroot/native.
 RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
         > /etc/apt/apt.conf.d/keep-cache
@@ -95,11 +104,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-buildhost,sha
     host_deps="$(dbs-host-deps /tmp/control)" && \
     echo "dbs: auto host tooling : ${host_deps:-<none>}" && \
     echo "dbs: extra host tooling: ${HOST_DEPS:-<none>}" && \
-    # Reject a user --host-deps that is not an exact package name. apt-get
-    # otherwise treats a name containing '.' as a POSIX regex when no literal
-    # package matches, so a typo like 'protobuf.' silently substring-installs
-    # dozens of unrelated packages instead of failing. dbs validated the token
-    # shape; this validates existence in the archive the deps install from.
     if [ -n "$HOST_DEPS" ]; then \
         names="$(apt-cache pkgnames)" && \
         for p in $HOST_DEPS; do \
@@ -119,8 +123,7 @@ ENTRYPOINT ["/usr/bin/crossbuild"]
 # Native build target  (dbs --native)
 # --------------------------------------------------------------------------
 FROM sysroot AS native
-# Re-declared for the cache-mount ids below; ARGs do not cross a FROM boundary.
-# The native target installs target-arch packages, so it shares sysroot's cache.
+
 ARG SUITE
 ARG DEB_ARCH=arm64
 ARG HOST_DEPS=

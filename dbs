@@ -39,6 +39,12 @@ Build options:
                                list them in debian/dbs-host-deps (one per line,
                                '#' comments).
   -h, --help                   Show this help
+
+Local package repo:
+  Built packages are copied into ~/dbs/localrepo/<dist>/<arch>/ and that
+  directory is exposed to the sysroot as an apt source, so a package built
+  earlier can satisfy another project's Build-Depends. Override the ~/dbs root
+  with the DBS_HOME environment variable.
 EOF
 }
 
@@ -151,6 +157,9 @@ case "$ARCH" in
     *)  echo "dbs: --arch must be '32' or '64' (got '$ARCH')" >&2; exit 1 ;;
 esac
 
+DBS_HOME="${DBS_HOME:-$HOME/dbs}"
+LOCALREPO="$DBS_HOME/localrepo/$DIST/$DEB_ARCH"
+
 PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd)"
 if [ ! -f "$PROJECT_DIR/debian/control" ]; then
     echo "dbs: '$PROJECT_DIR' has no debian/control — not a buildable project" >&2
@@ -164,11 +173,6 @@ if [ -f "$host_deps_file" ]; then
 fi
 HOST_DEPS="$(printf '%s' "$HOST_DEPS" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')"
 for dep in $HOST_DEPS; do
-    # Debian binary package names start with [a-z0-9] and then use only
-    # [a-z0-9+.-]. Reject anything else — leading punctuation, ':' multiarch
-    # qualifiers, '~', uppercase, shell metacharacters — so the value matches
-    # its "bare package name" contract and nothing unsafe reaches the unquoted
-    # `apt-get install $HOST_DEPS` in the Dockerfile.
     case "$dep" in
         [!a-z0-9]*|*[!a-z0-9+.-]*)
             echo "dbs: invalid host-dep '$dep' — expected a bare package name" >&2
@@ -189,6 +193,13 @@ cp "$BUILDER_DIR/Dockerfile" \
    "$CTX/"
 mkdir -p "$CTX/debian"
 cp "$PROJECT_DIR/debian/control" "$CTX/debian/control"
+
+mkdir -p "$LOCALREPO" "$CTX/localrepo"
+n_repo=$(find "$LOCALREPO" -maxdepth 1 -name '*.deb' -printf x | wc -c)
+if [ "$n_repo" -gt 0 ]; then
+    cp "$LOCALREPO"/*.deb "$CTX/localrepo/"
+    echo "dbs: local repo: $n_repo prebuilt package(s) from $LOCALREPO" >&2
+fi
 
 GEN_CL=""
 if [ ! -f "$PROJECT_DIR/debian/changelog" ]; then
@@ -241,11 +252,15 @@ fi
 [ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 
-# Colourised build output. dpkg-buildpackage -> cmake/ninja/gcc/clang each
-# decide whether to emit ANSI colour from isatty(); a bare `docker run` hands
-# them a pipe, so they go monochrome. When *our own* stdout is a real terminal,
-# allocate a pseudo-TTY for the container so every build tool sees an
-# interactive terminal and colourises (and ninja shows its live status line).
-# When piped/redirected we add nothing, keeping logs free of escape codes.
 [ -t 1 ] && run_args+=(-t)
 docker run "${run_args[@]}" "$IMAGE_ID"
+
+if [ "$LOCAL" -eq 0 ]; then
+    out_dir="$PROJECT_DIR/out/$DIST/$DEB_ARCH"
+    if compgen -G "$out_dir/*.deb" >/dev/null; then
+        mkdir -p "$LOCALREPO"
+        cp "$out_dir"/*.deb "$LOCALREPO"/
+        n_pub=$(find "$out_dir" -maxdepth 1 -name '*.deb' -printf x | wc -c)
+        echo "dbs: published $n_pub package(s) to local repo $LOCALREPO" >&2
+    fi
+fi

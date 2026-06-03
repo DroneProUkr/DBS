@@ -31,8 +31,9 @@ thing written back is the `out/` directory of finished packages.
 
 1. **Sysroot stage** — an *emulated* ARM `debian:<suite>` image (via QEMU)
    with the [Raspberry Pi](http://archive.raspberrypi.com/debian/) and
-   [dronerepo](https://zarcsis.github.io/dronerepo/) apt repositories added,
-   into which your project's `Build-Depends` are installed with
+   [dronerepo](https://zarcsis.github.io/dronerepo/) apt repositories added —
+   plus a [local repo](#local-package-repo) of packages you have already built
+   — into which your project's `Build-Depends` are installed with
    `mk-build-deps`. This becomes the target `/sysroot`.
 2. **Build stage** — a native amd64 image holding the cross-compilers
    (`crossbuild-essential-arm64` / `-armhf`), CMake, debhelper and the sysroot
@@ -208,6 +209,51 @@ project produces several binary packages, each is kept in its own
 `build/<dist>/<arch>/<pkg>/` subdirectory. The target `build/<dist>/<arch>/` is
 wiped and regenerated on each run. Handy for quickly inspecting or testing the
 compiled output without unpacking a `.deb`.
+
+---
+
+## Local package repo
+
+Every package `dbs` builds is copied into a local apt repository under your
+home directory, and that repository is added as a source in the **sysroot**
+stage. This lets packages depend on each other: build a library once and a
+later build of something that `Build-Depends` on it resolves it straight from
+your own previous output — no need to publish to dronerepo first.
+
+```
+~/dbs/localrepo/<dist>/<arch>/*.deb
+```
+
+The repo is namespaced by **suite *and* arch**. apt already filters by
+architecture, but a package built against the *wrong suite* (e.g. a bookworm
+build offered to a trixie sysroot) would otherwise look installable and could
+drag in an ABI-incompatible library — so each suite/arch keeps its own repo.
+
+How it works, per build:
+
+1. Before building, `dbs` stages `~/dbs/localrepo/<dist>/<arch>/` into the
+   docker context. The sysroot stage bind-mounts it, runs `dpkg-scanpackages`
+   to build a flat-repo index, and adds `deb [trusted=yes] file:/localrepo ./`
+   as an apt source for that one `mk-build-deps` invocation. The mount is
+   ephemeral — the `.deb` files and the index never enter an image layer, so
+   nothing is duplicated into the cross stage's `/sysroot`.
+2. After a successful build, the produced `.deb`s (from `out/<dist>/<arch>/`)
+   are copied into the local repo, ready for the next build.
+
+When two sources offer the same package, apt picks the **highest version** as
+usual — a locally built package (whose version `dbs` derives from git) wins
+only when it actually out-versions the archive copy.
+
+Notes:
+
+- The repo root defaults to `~/dbs`; set **`DBS_HOME`** to relocate it.
+- It starts empty and fills up as you build; nothing special is needed to
+  bootstrap it. Build order still matters — build a dependency *before* the
+  package that needs it.
+- `--local` builds emit a raw build tree rather than `.deb`s, so they publish
+  nothing to the local repo.
+- It is a plain directory of `.deb` files: delete stale ones by hand, or
+  `rm -rf ~/dbs/localrepo` to start over.
 
 ---
 
