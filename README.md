@@ -18,7 +18,7 @@ thing written back is the `out/` directory of finished packages.
   ──────────────────────────────────────────────────────────────────────
   dbs                                  ┌─ sysroot stage (emulated ARM) ──┐
    ├─ parse --dist/--arch/--local      │  debian:<suite> + raspberrypi   │
-   ├─ synthesise debian/changelog ─────│  + dronerepo apt repos          │
+   ├─ synthesise debian/changelog ─────│  + droneprorepo apt repos       │
    │   from git (dbs-changelog)        │  mk-build-deps from control     │
    ├─ assemble docker context          └─────────────┬───────────────────┘
    ├─ docker build  ──────────────────┐              │ COPY / → /sysroot
@@ -31,7 +31,7 @@ thing written back is the `out/` directory of finished packages.
 
 1. **Sysroot stage** — an *emulated* ARM `debian:<suite>` image (via QEMU)
    with the [Raspberry Pi](http://archive.raspberrypi.com/debian/) and
-   [dronerepo](https://zarcsis.github.io/dronerepo/) apt repositories added —
+   [droneprorepo](https://droneproukr.github.io/droneprorepo/) apt repositories added —
    plus a [local repo](#local-package-repo) of packages you have already built
    — into which your project's `Build-Depends` are installed with
    `mk-build-deps`. This becomes the target `/sysroot`.
@@ -142,7 +142,7 @@ Cross-builds `PROJECT_DIR` (default: current directory). It must contain a
 | `-l`, `--local` | | off | Emit the raw build tree into `build/<dist>/<arch>/` instead of `.deb`s into `out/<dist>/<arch>/` |
 | `-n`, `--native` | | off | Build **natively** inside the emulated target-arch container (QEMU) instead of cross-compiling. Slower, but builds packages that don't cross-compile. |
 | `-p`, `--publish` | | off | After a successful build, copy the `.deb`s into the [local package repo](#local-package-repo) so other projects can resolve them as `Build-Depends`. Without it, packages stay in `out/` only. |
-| `--host-deps` | `"PKG..."` | none | Extra build packages to install for the build (repeatable; also via `debian/dbs-host-deps`). Cross: on the amd64 host (Debian main only). Native: in the target container (Debian/Pi/dronerepo). |
+| `--host-deps` | `"PKG..."` | none | Extra build packages to install for the build (repeatable; also via `debian/dbs-host-deps`). Cross: on the amd64 host (Debian main only). Native: in the target container (Debian/Pi/droneprorepo). |
 | `-h`, `--help` | | | Show usage |
 
 Anything after `--` is forwarded verbatim to `docker build` (e.g.
@@ -224,37 +224,76 @@ compiled output without unpacking a `.deb`.
 
 ## Local package repo
 
-`dbs` keeps a local apt repository under your home directory and adds it as a
-source in the **sysroot** stage of *every* build. This lets packages depend on
-each other: build a library, publish it, and a later build of something that
-`Build-Depends` on it resolves it straight from your own previous output — no
-need to publish to dronerepo first.
+`dbs` keeps a clone of the project package repo
+([`droneprorepo`](https://github.com/DroneProUkr/droneprorepo) —
+the source of <https://droneproukr.github.io/droneprorepo/>) under your home
+directory and adds its package pool as a source in the **sysroot** stage of
+*every* build. This lets packages depend on each other: build a library,
+publish it, and a later build of something that `Build-Depends` on it resolves
+it straight from your own previous output — no need to push to droneprorepo
+first.
+
+On first use `dbs` runs `git clone git@github.com:DroneProUkr/droneprorepo.git`
+into `~/dbs/droneprorepo`. Published packages are dropped into that clone's
+`pool/<suite>/main/` directories — the same layout the real repo commits — but
+`dbs` **never** runs `git add` or `git commit`. Publishing just stages files on
+disk; you review and commit them yourself, then push to share them.
 
 Reading from the repo is automatic; **writing** to it is opt-in. Pass
-`-p` / `--publish` to copy a build's `.deb`s into the repo. Without it the
+`-p` / `--publish` to copy a build's `.deb`s into the pool. Without it the
 packages stay in `out/<dist>/<arch>/` and nothing is shared with other
 projects.
 
 ```
-~/dbs/localrepo/<dist>/<arch>/*.deb
+~/dbs/droneprorepo/pool/<suite>/main/*.deb
 ```
 
-The repo is namespaced by **suite *and* arch**. apt already filters by
-architecture, but a package built against the *wrong suite* (e.g. a bookworm
-build offered to a trixie sysroot) would otherwise look installable and could
-drag in an ABI-incompatible library — so each suite/arch keeps its own repo.
+The pool mixes architectures (`arm64`, `armhf`, `all`) in one directory per
+suite, exactly like the published repo; apt filters by architecture when
+resolving build-deps. Staging into a build only pulls the packages that build
+needs — the target arch plus the `_all` (arch-independent) ones.
+
+**One version per package.** When you publish, `dbs` keeps a single newest copy
+of each package+arch in the pool:
+
+- A **newer or equal** build replaces the copy already there — older `.deb`
+  files for that package+arch are deleted, so the pool never accumulates stale
+  versions.
+- An **older** build is refused: `dbs` prints a warning and leaves the existing
+  newer package in place. Bump the version (it derives from git) and rebuild to
+  publish.
 
 How it works, per build:
 
-1. Before building, `dbs` stages `~/dbs/localrepo/<dist>/<arch>/` into the
-   docker context. The sysroot stage bind-mounts it, runs `dpkg-scanpackages`
-   to build a flat-repo index, and adds `deb [trusted=yes] file:/localrepo ./`
-   as an apt source for that one `mk-build-deps` invocation. The mount is
+1. Before building, `dbs` ensures the clone exists, then stages the relevant
+   `.deb`s out of `~/dbs/droneprorepo/pool/<suite>/main/` into the docker
+   context. The sysroot stage bind-mounts them, runs `dpkg-scanpackages` to
+   build a flat-repo index, and adds `deb [trusted=yes] file:/localrepo ./` as
+   an apt source for that one `mk-build-deps` invocation. The mount is
    ephemeral — the `.deb` files and the index never enter an image layer, so
    nothing is duplicated into the cross stage's `/sysroot`.
-2. After a successful build, **only when `-p` / `--publish` is given**, the
-   produced `.deb`s (from `out/<dist>/<arch>/`) are copied into the local repo,
-   ready for the next build. Plain builds leave the repo untouched.
+2. After a successful build, **only when `-p` / `--publish` is given**, `dbs`
+   first runs **`git pull`** on the clone so the pool reflects whatever has been
+   pushed to droneprorepo since (see below), then publishes the produced `.deb`s
+   (from `out/<dist>/<arch>/`) into the pool per the one-version rule above.
+   Plain builds leave the repo untouched.
+
+**Pull before publish.** Because the pool is a real git clone that other people
+also push to, `-p` syncs it before adding your packages, and reconciles any
+divergence by the same rule as everything else — **higher version wins, and on
+an equal version the local copy wins**:
+
+- The pull is a `git fetch` + `git merge` (a merge commit only if your branch
+  has un-pushed commits). Genuine same-path merge conflicts resolve toward your
+  local copy; differing versions are just different files and both arrive, after
+  which the older one is pruned.
+- After the pull, your freshly built package is compared against the *synced*
+  pool: if upstream already has a higher version, the build is refused with a
+  warning (you can't downgrade the repo); otherwise it replaces the older copy.
+- If the fetch fails (offline, detached HEAD, no upstream branch), `dbs` warns
+  and publishes against the local pool only — a network hiccup never blocks a
+  build. As always, `dbs` only moves `.deb` files around; it never `git add`s or
+  commits your published packages.
 
 When two sources offer the same package, apt picks the **highest version** as
 usual — a locally built package (whose version `dbs` derives from git) wins
@@ -262,14 +301,16 @@ only when it actually out-versions the archive copy.
 
 Notes:
 
-- The repo root defaults to `~/dbs`; set **`DBS_HOME`** to relocate it.
-- It starts empty and fills up as you build **with `-p`**; nothing special is
-  needed to bootstrap it. Build order still matters — build and publish a
-  dependency *before* the package that needs it.
+- The repo root defaults to `~/dbs`; set **`DBS_HOME`** to relocate it, or
+  **`DBS_REPO_DIR`** to point `dbs` at an existing droneprorepo checkout.
+- The clone is created once and reused; `-p` pulls it fresh before each
+  publish. To publish a dependency for another build, build order still matters
+  — build and publish the dependency *before* the package that needs it.
 - `--local` builds emit a raw build tree rather than `.deb`s, so there is
   nothing to publish even with `-p`.
-- It is a plain directory of `.deb` files: delete stale ones by hand, or
-  `rm -rf ~/dbs/localrepo` to start over.
+- The pool is just `.deb` files in a git working tree: `git status` in
+  `~/dbs/droneprorepo` shows what publishing added, and you commit/push to
+  share it (or `git checkout`/`git clean` to discard).
 
 ---
 
@@ -284,7 +325,7 @@ fields `dbs` cares about:
   target arch; architecture-independent build *tooling* (dh add-on sequences,
   `Architecture: all` helpers) is installed natively on the build host so `dh`
   can run it. These dependencies are resolved from the Debian, Raspberry Pi and
-  dronerepo archives.
+  droneprorepo archives.
 - **`debian/rules`** — a debhelper rules file. If the upstream source lives in
   a subdirectory (commonly a git **submodule**), point debhelper at it with
   `--sourcedirectory`; `dbs` reads the same option to know which git tree to
@@ -303,9 +344,9 @@ fields `dbs` cares about:
   passed ad-hoc with `--host-deps "PKG..."` (handy when you must keep a
   project's `debian/` pristine). In **cross** builds these install on the amd64
   build host, which carries only the Debian archive — so they must be packages
-  available in Debian **main** (the raspi/dronerepo repos exist only in the
+  available in Debian **main** (the raspi/droneprorepo repos exist only in the
   sysroot stage). In **native** builds (`-n`) they install inside the
-  target-arch container instead, which also has the Raspberry Pi and dronerepo
+  target-arch container instead, which also has the Raspberry Pi and droneprorepo
   archives. Each entry must be an **exact** package name; an unknown name (e.g.
   a typo) fails the build with a clear error rather than being silently
   substring-expanded by `apt-get`.

@@ -29,8 +29,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},s
     equivs \
     curl
 
-RUN curl -fsSL https://zarcsis.github.io/dronerepo/repo.key -o /etc/apt/trusted.gpg.d/dronerepo.asc
-RUN echo "deb https://zarcsis.github.io/dronerepo/ ${SUITE} main" > /etc/apt/sources.list.d/dronerepo.list
+RUN curl -fsSL https://droneproukr.github.io/droneprorepo/repo.key -o /etc/apt/trusted.gpg.d/droneprorepo.asc
+RUN echo "deb https://droneproukr.github.io/droneprorepo/ ${SUITE} main" > /etc/apt/sources.list.d/droneprorepo.list
 
 WORKDIR /workspace
 COPY debian/control debian/control
@@ -145,7 +145,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},s
         names="$(apt-cache pkgnames)" && \
         for p in $HOST_DEPS; do \
             printf '%s\n' "$names" | grep -Fxq "$p" || \
-                { echo "dbs: host-dep '$p' is not a package in the target archives (Debian/Pi/dronerepo)" >&2; exit 1; }; \
+                { echo "dbs: host-dep '$p' is not a package in the target archives (Debian/Pi/droneprorepo)" >&2; exit 1; }; \
         done && \
         apt-get install -y --no-install-recommends $HOST_DEPS; \
     fi

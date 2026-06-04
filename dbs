@@ -51,11 +51,18 @@ Build options:
   value-taking flag may end a bundle, so -npa 32 means -n -p -a 32.
 
 Local package repo:
-  With -p/--publish, built packages are copied into
-  ~/dbs/localrepo/<dist>/<arch>/ and that directory is exposed to the sysroot
-  as an apt source, so a package built earlier can satisfy another project's
-  Build-Depends. Override the ~/dbs root with the DBS_HOME environment
-  variable.
+  dbs keeps a clone of the project package repo
+  (git@github.com:DroneProUkr/droneprorepo.git) at ~/dbs/droneprorepo and uses
+  its pool/<dist>/main/ directories as a local file repo, so a package built
+  earlier can satisfy another project's Build-Depends. With -p/--publish, dbs
+  first runs git pull on the clone (resolving any divergence toward the higher
+  package version, and toward the local copy when versions match), then copies
+  built packages into that pool, keeping only the newest version of each
+  package+arch (older duplicates are removed). Building an older version than the
+  one already in the repo prints a warning and is NOT published. dbs never runs
+  git add/commit on the published .deb files — review and commit them yourself.
+  Override the ~/dbs root with DBS_HOME, or point at an existing checkout with
+  DBS_REPO_DIR.
 EOF
 }
 
@@ -213,7 +220,167 @@ case "$ARCH" in
 esac
 
 DBS_HOME="${DBS_HOME:-$HOME/dbs}"
-LOCALREPO="$DBS_HOME/localrepo/$DIST/$DEB_ARCH"
+REPO_GIT_URL="git@github.com:DroneProUkr/droneprorepo.git"
+# A clone of droneprorepo used as a local file repo. Its pool/<dist>/main/
+# directories hold the .deb files (all arches mixed, exactly like the real
+# repo). dbs only adds/removes files here — never git add/commit — so the new
+# packages can be reviewed and committed by hand.
+LOCALREPO_DIR="${DBS_REPO_DIR:-$DBS_HOME/droneprorepo}"
+LOCALREPO="$LOCALREPO_DIR/pool/$DIST/main"
+
+# Make sure the droneprorepo clone exists; clone it on first use.
+ensure_localrepo() {
+    if [ -d "$LOCALREPO_DIR/.git" ]; then
+        return 0
+    fi
+    if [ -e "$LOCALREPO_DIR" ] && [ -n "$(ls -A "$LOCALREPO_DIR" 2>/dev/null)" ]; then
+        echo "dbs: '$LOCALREPO_DIR' exists but is not a git clone of the package repo" >&2
+        echo "dbs: remove it or set DBS_REPO_DIR to a droneprorepo checkout" >&2
+        exit 1
+    fi
+    echo "dbs: cloning package repo $REPO_GIT_URL -> $LOCALREPO_DIR" >&2
+    git clone "$REPO_GIT_URL" "$LOCALREPO_DIR"
+}
+
+# Publish one built .deb into the repo pool, keeping only the newest version of
+# each package+arch. Prints a warning and returns non-zero (so the caller counts
+# it as skipped) when a newer version is already present.
+publish_deb() {
+    local src="$1" pool="$2"
+    local fname base arch rest version name
+    fname="$(basename -- "$src")"
+    base="${fname%.deb}"
+    arch="${base##*_}"          # name_version_arch -> arch
+    rest="${base%_*}"           # name_version
+    version="${rest##*_}"       # version (Debian versions have no '_')
+    name="${rest%_*}"           # name
+
+    # Highest version of this same package+arch already in the pool, if any.
+    local newest_ver="" f b fver
+    for f in "$pool/${name}"_*_"${arch}.deb"; do
+        [ -e "$f" ] || continue
+        b="$(basename -- "$f")"; b="${b%.deb}"; b="${b%_*}"
+        fver="${b##*_}"
+        if [ -z "$newest_ver" ] || dpkg --compare-versions "$fver" gt "$newest_ver"; then
+            newest_ver="$fver"
+        fi
+    done
+
+    if [ -n "$newest_ver" ] && dpkg --compare-versions "$version" lt "$newest_ver"; then
+        echo "dbs: WARNING: built $name $version is older than $newest_ver already in the repo — not publishing $fname" >&2
+        return 1
+    fi
+
+    # Newer (or equal, or first) version wins: drop every older copy so the pool
+    # keeps a single, newest version of this package+arch.
+    for f in "$pool/${name}"_*_"${arch}.deb"; do
+        [ -e "$f" ] || continue
+        rm -f "$f"
+    done
+    cp "$src" "$pool/"
+    if [ -n "$newest_ver" ] && [ "$newest_ver" != "$version" ]; then
+        echo "dbs: published $name $version ($arch), replaced $newest_ver" >&2
+    else
+        echo "dbs: published $name $version ($arch)" >&2
+    fi
+    return 0
+}
+
+# Collapse a pool directory to a single newest version per package+arch, deleting
+# every older duplicate. Distinct versions have distinct filenames, so there are
+# no same-version ties to break here (those are handled when files are written).
+dedupe_pool() {
+    local pool="$1"
+    local -A best_ver best_file
+    local f b arch rest version name key
+    for f in "$pool"/*.deb; do
+        [ -e "$f" ] || continue
+        b="$(basename -- "$f")"; b="${b%.deb}"
+        arch="${b##*_}"; rest="${b%_*}"; version="${rest##*_}"; name="${rest%_*}"
+        key="$name|$arch"
+        if [ -z "${best_ver[$key]:-}" ]; then
+            best_ver[$key]="$version"; best_file[$key]="$f"
+        elif dpkg --compare-versions "$version" gt "${best_ver[$key]}"; then
+            rm -f "${best_file[$key]}"
+            best_ver[$key]="$version"; best_file[$key]="$f"
+        else
+            rm -f "$f"
+        fi
+    done
+}
+
+# git pull the package repo before publishing, resolving any divergence toward
+# the higher package version (and toward the local copy when versions match).
+# Always returns 0 so a repo/network hiccup never blocks the local publish; it is
+# meant to be called as `if ! repo_sync; then ...` so errexit can't abort here.
+repo_sync() {
+    git -C "$LOCALREPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+    local branch
+    branch="$(git -C "$LOCALREPO_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [ -z "$branch" ]; then
+        echo "dbs: package repo in detached HEAD — skipping git pull" >&2
+        return 0
+    fi
+
+    echo "dbs: git pull (origin/$branch) before publishing..." >&2
+    if ! git -C "$LOCALREPO_DIR" fetch --quiet origin "$branch" 2>/dev/null; then
+        echo "dbs: WARNING: git fetch failed — publishing against the local pool only" >&2
+        return 0
+    fi
+
+    local upstream
+    upstream="$(git -C "$LOCALREPO_DIR" rev-parse --quiet --verify FETCH_HEAD 2>/dev/null || true)"
+    [ -z "$upstream" ] && upstream="$(git -C "$LOCALREPO_DIR" rev-parse --quiet --verify "origin/$branch" 2>/dev/null || true)"
+    if [ -z "$upstream" ]; then
+        echo "dbs: no origin/$branch yet — nothing to pull" >&2
+        return 0
+    fi
+
+    if [ "$(git -C "$LOCALREPO_DIR" rev-parse HEAD 2>/dev/null || true)" != "$upstream" ]; then
+        # A merge refuses to clobber a working-tree .deb that the incoming commit
+        # also touches. Our packages are exactly such files — untracked (just
+        # published, not yet committed) or tracked-but-modified (a same-version
+        # rebuild). Set both kinds aside, restore a clean tree, merge, then reapply
+        # them under the version rule (publish_deb keeps the newer one, local
+        # content on a tie) so a local edit never blocks pulling everyone else's.
+        local stash_dir="$CTX/repo-untracked"
+        mkdir -p "$stash_dir"
+        local saved=() rel
+        # Untracked pool debs — no --exclude-standard, so a build that happens to
+        # be .gitignore'd is still set aside and can win a version tie locally.
+        while IFS= read -r rel; do
+            case "$rel" in *.deb) ;; *) continue ;; esac
+            mkdir -p "$stash_dir/$(dirname "$rel")"
+            mv "$LOCALREPO_DIR/$rel" "$stash_dir/$rel" && saved+=("$rel")
+        done < <(git -C "$LOCALREPO_DIR" ls-files --others -- pool 2>/dev/null)
+        # Tracked pool debs modified in the worktree: copy aside, then check the
+        # committed content back out so the merge sees a clean path.
+        while IFS= read -r rel; do
+            case "$rel" in *.deb) ;; *) continue ;; esac
+            mkdir -p "$stash_dir/$(dirname "$rel")"
+            cp "$LOCALREPO_DIR/$rel" "$stash_dir/$rel" 2>/dev/null && saved+=("$rel")
+            git -C "$LOCALREPO_DIR" checkout -q -- "$rel" 2>/dev/null || true
+        done < <(git -C "$LOCALREPO_DIR" diff --name-only -- pool 2>/dev/null)
+
+        # -X ours: take our side for any genuine same-path conflict, so the merge
+        # never stops half-done; higher versions are different files and merge in.
+        if ! git -C "$LOCALREPO_DIR" merge --no-edit --no-stat -X ours "$upstream" >/dev/null 2>&1; then
+            echo "dbs: WARNING: git merge failed — keeping the local pool unchanged" >&2
+            git -C "$LOCALREPO_DIR" merge --abort >/dev/null 2>&1 || true
+        fi
+
+        for rel in ${saved[@]+"${saved[@]}"}; do
+            mkdir -p "$LOCALREPO_DIR/$(dirname "$rel")"
+            publish_deb "$stash_dir/$rel" "$LOCALREPO_DIR/$(dirname "$rel")" >/dev/null 2>&1 || true
+        done
+    fi
+
+    # The merge can pull an older copy alongside a newer one (a package, two
+    # versions, two filenames) — collapse this dist's pool to the newest of each.
+    dedupe_pool "$LOCALREPO"
+    return 0
+}
 
 PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd)"
 if [ ! -f "$PROJECT_DIR/debian/control" ]; then
@@ -249,10 +416,17 @@ cp "$BUILDER_DIR/Dockerfile" \
 mkdir -p "$CTX/debian"
 cp "$PROJECT_DIR/debian/control" "$CTX/debian/control"
 
+ensure_localrepo
 mkdir -p "$LOCALREPO" "$CTX/localrepo"
-n_repo=$(find "$LOCALREPO" -maxdepth 1 -name '*.deb' -printf x | wc -c)
+# Stage the packages relevant to this build (target arch + arch-independent)
+# out of the shared pool into the docker context.
+n_repo=0
+for f in "$LOCALREPO"/*_"$DEB_ARCH".deb "$LOCALREPO"/*_all.deb; do
+    [ -e "$f" ] || continue
+    cp "$f" "$CTX/localrepo/"
+    n_repo=$((n_repo + 1))
+done
 if [ "$n_repo" -gt 0 ]; then
-    cp "$LOCALREPO"/*.deb "$CTX/localrepo/"
     echo "dbs: local repo: $n_repo prebuilt package(s) from $LOCALREPO" >&2
 fi
 
@@ -314,8 +488,19 @@ if [ "$LOCAL" -eq 0 ] && [ "$PUBLISH" -eq 1 ]; then
     out_dir="$PROJECT_DIR/out/$DIST/$DEB_ARCH"
     if compgen -G "$out_dir/*.deb" >/dev/null; then
         mkdir -p "$LOCALREPO"
-        cp "$out_dir"/*.deb "$LOCALREPO"/
-        n_pub=$(find "$out_dir" -maxdepth 1 -name '*.deb' -printf x | wc -c)
-        echo "dbs: published $n_pub package(s) to local repo $LOCALREPO" >&2
+        if ! repo_sync; then
+            echo "dbs: WARNING: package repo sync hit an error — continuing" >&2
+        fi
+        n_pub=0; n_skip=0
+        for deb in "$out_dir"/*.deb; do
+            if publish_deb "$deb" "$LOCALREPO"; then
+                n_pub=$((n_pub + 1))
+            else
+                n_skip=$((n_skip + 1))
+            fi
+        done
+        echo "dbs: published $n_pub package(s) to $LOCALREPO" >&2
+        [ "$n_skip" -gt 0 ] && echo "dbs: skipped $n_skip older package(s)" >&2
+        echo "dbs: review and 'git commit' the new .deb files in $LOCALREPO_DIR" >&2
     fi
 fi
