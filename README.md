@@ -122,6 +122,11 @@ directory):
   basename, sanitised to a valid Debian name (lowercase `[a-z0-9][a-z0-9+.-]+`).
   **Edit this** to describe the package and list its `Build-Depends`.
 - `debian/rules` — a one-line `dh $@` rules file.
+- `.github/workflows/build-debs.yml` — a ready-to-run GitHub Actions workflow
+  that cross-builds the full `bookworm`/`trixie` × `armhf`/`arm64` matrix with
+  `dbs` and, on the default branch, publishes the `.deb`s as a GitHub release.
+  The template is generic (the repo and image are derived from the GitHub
+  context), so no editing is needed. An existing workflow is left untouched.
 
 No `debian/changelog` and no `debian/source/format` are written — `dbs`
 synthesises both at build time, keeping the project tree minimal.
@@ -396,6 +401,7 @@ is generated. Likewise, a missing `debian/source/format` defaults to
 | `crossbuild` | Container entrypoint: runs `dpkg-buildpackage`, sorts `out/` (or `build/` with `--local`). |
 | `aarch64-linux-gnu-pkg-config`, `arm-linux-gnueabihf-pkg-config` | `pkg-config` wrappers pointing at `/sysroot`. |
 | `rpi-arm64.toolchain.cmake`, `rpi-armhf.toolchain.cmake` | CMake cross-compile toolchains. |
+| `templates/control`, `templates/rules`, `templates/build-debs.yml` | Scaffolding `dbs init` writes into a new project. |
 
 ---
 

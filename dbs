@@ -12,6 +12,9 @@ Usage:
                                       (default: current directory). Package name
                                       is the directory's basename. No changelog —
                                       dbs synthesises one from git at build time.
+                                      Also drops a ready-to-run
+                                      .github/workflows/build-debs.yml (an
+                                      existing one is left untouched).
 
   dbs [PROJECT_DIR] [options] [-- docker-build-args]
                                       Cross-build PROJECT_DIR (default: current
@@ -111,6 +114,24 @@ cmd_init() {
     fi
     cp "$rules_tmpl" "$target/debian/rules"
     chmod +x "$target/debian/rules"
+
+    # GitHub Actions workflow that cross-builds the matrix and publishes a
+    # release on the default branch. The template is generic (it derives the
+    # repo/image from the GitHub context), so it is copied verbatim. An existing
+    # workflow is left untouched rather than clobbered.
+    local wf_tmpl="$BUILDER_DIR/templates/build-debs.yml"
+    if [ ! -f "$wf_tmpl" ]; then
+        echo "dbs init: missing template '$wf_tmpl' — broken dbs installation" >&2
+        exit 1
+    fi
+    local wf_dest="$target/.github/workflows/build-debs.yml"
+    if [ -e "$wf_dest" ]; then
+        echo "dbs init: '$wf_dest' already exists — leaving it untouched" >&2
+    else
+        mkdir -p "$target/.github/workflows"
+        cp "$wf_tmpl" "$wf_dest"
+        echo "dbs init: created .github/workflows/build-debs.yml" >&2
+    fi
 
     echo "dbs init: created debian/ for package '$pkg' in $target" >&2
     echo "dbs init: build it with 'dbs' (from $target)" >&2
