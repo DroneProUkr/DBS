@@ -123,6 +123,12 @@ jobs:
           [ -n "$version" ] || { echo "::error::could not parse version from generated changelog"; exit 1; }
           awk 'NR==1{next} /^ -- /{exit} NF{seen=1} seen{print}' changelog > RELEASE_NOTES.md
           case "$version" in *+*|*~*) prerelease=true ;; *) prerelease=false ;; esac
+          upstream="${version#*:}"            # strip optional epoch "N:"
+          major="${upstream%%[.~+-]*}"        # leading component before . ~ + -
+          case "$major" in
+            ''|*[!0-9]*) ;;                   # non-numeric major: keep prerelease as-is
+            *) [ "$major" -ge 1 ] || prerelease=true ;;
+          esac
           tag="v$(printf '%s' "$version" | tr '~' '-')"
           git check-ref-format "refs/tags/$tag" || { echo "::error::computed tag '$tag' is not a valid git ref"; exit 1; }
           {
