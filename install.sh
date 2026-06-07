@@ -5,10 +5,10 @@
 # Installs only when all dependencies are present.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/zarcsis/DBS/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DroneProUkr/DBS/main/install.sh | sh
 set -eu
 
-REPO_URL="https://github.com/zarcsis/DBS.git"
+REPO_URL="https://github.com/DroneProUkr/DBS.git"
 BIN_DIR="${DBS_BIN_DIR:-$HOME/bin}"
 CLONE_DIR="$BIN_DIR/DBS"
 

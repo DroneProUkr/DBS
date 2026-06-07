@@ -89,7 +89,7 @@ One-liner — clones DBS into `~/bin`, symlinks the CLI, adds `~/bin` to your
 runtime dependencies:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zarcsis/DBS/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DroneProUkr/DBS/main/install.sh | sh
 ```
 
 It's safe to re-run: an existing checkout is updated with `git pull` instead
@@ -101,7 +101,7 @@ needs. The manual equivalent:
 ```sh
 mkdir -p ~/bin                       # assuming ~/bin is on PATH
 cd ~/bin
-git clone https://github.com/zarcsis/DBS.git
+git clone https://github.com/DroneProUkr/DBS.git
 ln -s DBS/dbs .                      # ~/bin/dbs -> DBS/dbs
 ```
 
