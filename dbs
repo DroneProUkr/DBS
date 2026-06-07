@@ -12,9 +12,12 @@ Usage:
                                       (default: current directory). Package name
                                       is the directory's basename. No changelog —
                                       dbs synthesises one from git at build time.
-                                      Also drops a ready-to-run
-                                      .github/workflows/build-debs.yml (an
-                                      existing one is left untouched).
+                                      Each template file (debian/control,
+                                      debian/rules, .github/workflows/
+                                      build-debs.yml) is checked individually;
+                                      missing ones are added and existing ones
+                                      are left untouched, so init can be re-run
+                                      to fill in whatever is missing.
 
   dbs [PROJECT_DIR] [options] [-- docker-build-args]
                                       Cross-build PROJECT_DIR (default: current
@@ -91,50 +94,70 @@ cmd_init() {
         echo "dbs init: package name '$pkg' (sanitised from directory '$name')" >&2
     fi
 
-    if [ -e "$target/debian" ]; then
-        echo "dbs init: '$target/debian' already exists — refusing to overwrite" >&2
+    # Each template file is checked and created independently, so init can be
+    # re-run on a partially-scaffolded project to fill in whatever is missing —
+    # an existing file is always left untouched rather than clobbered.
+    local created=0 present=0
+
+    require_tmpl() {
+        [ -f "$1" ] && return 0
+        echo "dbs init: missing template '$1' — broken dbs installation" >&2
         exit 1
+    }
+
+    # debian/control — @PKG@ substituted with the (sanitised) package name.
+    local control_tmpl="$BUILDER_DIR/templates/control"
+    local control_dest="$target/debian/control"
+    require_tmpl "$control_tmpl"
+    if [ -e "$control_dest" ]; then
+        echo "dbs init: 'debian/control' already exists — leaving it untouched" >&2
+        present=$((present + 1))
+    else
+        mkdir -p "$target/debian"
+        local control
+        control="$(cat "$control_tmpl")"
+        printf '%s\n' "${control//@PKG@/$pkg}" > "$control_dest"
+        echo "dbs init: created debian/control" >&2
+        created=$((created + 1))
     fi
 
-    mkdir -p "$target/debian"
-
-    local tmpl="$BUILDER_DIR/templates/control"
-    if [ ! -f "$tmpl" ]; then
-        echo "dbs init: missing template '$tmpl' — broken dbs installation" >&2
-        exit 1
-    fi
-    local control
-    control="$(cat "$tmpl")"
-    printf '%s\n' "${control//@PKG@/$pkg}" > "$target/debian/control"
-
+    # debian/rules — copied verbatim and made executable.
     local rules_tmpl="$BUILDER_DIR/templates/rules"
-    if [ ! -f "$rules_tmpl" ]; then
-        echo "dbs init: missing template '$rules_tmpl' — broken dbs installation" >&2
-        exit 1
+    local rules_dest="$target/debian/rules"
+    require_tmpl "$rules_tmpl"
+    if [ -e "$rules_dest" ]; then
+        echo "dbs init: 'debian/rules' already exists — leaving it untouched" >&2
+        present=$((present + 1))
+    else
+        mkdir -p "$target/debian"
+        cp "$rules_tmpl" "$rules_dest"
+        chmod +x "$rules_dest"
+        echo "dbs init: created debian/rules" >&2
+        created=$((created + 1))
     fi
-    cp "$rules_tmpl" "$target/debian/rules"
-    chmod +x "$target/debian/rules"
 
     # GitHub Actions workflow that cross-builds the matrix and publishes a
     # release on the default branch. The template is generic (it derives the
-    # repo/image from the GitHub context), so it is copied verbatim. An existing
-    # workflow is left untouched rather than clobbered.
+    # repo/image from the GitHub context), so it is copied verbatim.
     local wf_tmpl="$BUILDER_DIR/templates/build-debs.yml"
-    if [ ! -f "$wf_tmpl" ]; then
-        echo "dbs init: missing template '$wf_tmpl' — broken dbs installation" >&2
-        exit 1
-    fi
     local wf_dest="$target/.github/workflows/build-debs.yml"
+    require_tmpl "$wf_tmpl"
     if [ -e "$wf_dest" ]; then
-        echo "dbs init: '$wf_dest' already exists — leaving it untouched" >&2
+        echo "dbs init: '.github/workflows/build-debs.yml' already exists — leaving it untouched" >&2
+        present=$((present + 1))
     else
         mkdir -p "$target/.github/workflows"
         cp "$wf_tmpl" "$wf_dest"
         echo "dbs init: created .github/workflows/build-debs.yml" >&2
+        created=$((created + 1))
     fi
 
-    echo "dbs init: created debian/ for package '$pkg' in $target" >&2
-    echo "dbs init: build it with 'dbs' (from $target)" >&2
+    if [ "$created" -eq 0 ]; then
+        echo "dbs init: all template files already present in $target — nothing to do" >&2
+    else
+        echo "dbs init: package '$pkg' in $target ($created added, $present already present)" >&2
+        echo "dbs init: build it with 'dbs' (from $target)" >&2
+    fi
 }
 
 # --------------------------------------------------------------------------
