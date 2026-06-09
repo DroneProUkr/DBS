@@ -51,10 +51,13 @@ Build options:
                                container (Debian/Pi/dronerepo). A project may also
                                list them in debian/dbs-host-deps (one per line,
                                '#' comments).
-  --build-var KEY=VALUE        Forward an environment variable into the build,
-                               where debian/rules can read it as a make variable
-                               ($(KEY)) to vary the build — e.g. select a product
-                               variant. Repeatable. KEY must be a valid shell
+  -DKEY=VALUE                  Forward a build variable into the build as an
+                               environment variable, where debian/rules reads it
+                               as a make variable ($(KEY)) to vary the build —
+                               e.g. -DPROT=ARDU to override a cmake option the
+                               project exposes via 'PROT ?= ...' in debian/rules.
+                               cmake-style; a space form (-D KEY=VALUE) also
+                               works. Repeatable. KEY must be a valid shell
                                identifier ([A-Za-z_][A-Za-z0-9_]*).
   -h, --help                   Show this help
 
@@ -89,8 +92,6 @@ cmd_init() {
 
     local name pkg
     name="$(basename -- "$target")"
-    # Debian source/binary package names must be lowercase and match
-    # [a-z0-9][a-z0-9+.-]+ — sanitise the directory name into that shape.
     pkg="$(printf '%s' "$name" \
         | tr '[:upper:]' '[:lower:]' \
         | sed -E 's/[^a-z0-9+.-]+/-/g; s/^[-+.]+//; s/[-+.]+$//')"
@@ -99,9 +100,6 @@ cmd_init() {
         echo "dbs init: package name '$pkg' (sanitised from directory '$name')" >&2
     fi
 
-    # Each template file is checked and created independently, so init can be
-    # re-run on a partially-scaffolded project to fill in whatever is missing —
-    # an existing file is always left untouched rather than clobbered.
     local created=0 present=0
 
     require_tmpl() {
@@ -110,7 +108,6 @@ cmd_init() {
         exit 1
     }
 
-    # debian/control — @PKG@ substituted with the (sanitised) package name.
     local control_tmpl="$BUILDER_DIR/templates/control"
     local control_dest="$target/debian/control"
     require_tmpl "$control_tmpl"
@@ -126,7 +123,6 @@ cmd_init() {
         created=$((created + 1))
     fi
 
-    # debian/rules — copied verbatim and made executable.
     local rules_tmpl="$BUILDER_DIR/templates/rules"
     local rules_dest="$target/debian/rules"
     require_tmpl "$rules_tmpl"
@@ -141,9 +137,6 @@ cmd_init() {
         created=$((created + 1))
     fi
 
-    # GitHub Actions workflow that cross-builds the matrix and publishes a
-    # release on the default branch. The template is generic (it derives the
-    # repo/image from the GitHub context), so it is copied verbatim.
     local wf_tmpl="$BUILDER_DIR/templates/build-debs.yml"
     local wf_dest="$target/.github/workflows/build-debs.yml"
     require_tmpl "$wf_tmpl"
@@ -205,10 +198,10 @@ expand_short_opts() {
                             if [ -n "$opt" ]; then
                                 cluster+=("-$c" "${opt#=}"); opt=""
                             else
-                                consume="-$c"   # value comes from the next argv token
+                                consume="-$c"
                             fi
                             ;;
-                        *) ok=0; break ;;       # not a clean cluster — leave it alone
+                        *) ok=0; break ;;
                     esac
                 done
                 if [ "$ok" -eq 0 ]; then
@@ -233,8 +226,6 @@ set -- ${EXPANDED[@]+"${EXPANDED[@]}"}
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        # short -d/-a (incl. -d=val and bundled) are normalised to '-d val' by
-        # expand_short_opts above, so only the long =forms reach these arms.
         --dist|-d)     need_val "$1" "$#"; DIST="$2"; shift 2 ;;
         --dist=*)      DIST="${1#*=}";   shift ;;
         --arch|-a)     need_val "$1" "$#"; ARCH="$2"; shift 2 ;;
@@ -244,8 +235,8 @@ while [ $# -gt 0 ]; do
         --publish|-p)  PUBLISH=1;        shift ;;
         --host-deps)   need_val "$1" "$#"; HOST_DEPS="$HOST_DEPS $2"; shift 2 ;;
         --host-deps=*) HOST_DEPS="$HOST_DEPS ${1#*=}"; shift ;;
-        --build-var)   need_val "$1" "$#"; BUILD_VARS+=("$2"); shift 2 ;;
-        --build-var=*) BUILD_VARS+=("${1#*=}"); shift ;;
+        -D)            need_val "$1" "$#"; BUILD_VARS+=("$2"); shift 2 ;;
+        -D*)           BUILD_VARS+=("${1#-D}"); shift ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; DOCKER_ARGS+=("$@"); break ;;
         *)
@@ -273,14 +264,9 @@ esac
 
 DBS_HOME="${DBS_HOME:-$HOME/dbs}"
 REPO_GIT_URL="git@github.com:DroneProUkr/droneprorepo.git"
-# A clone of droneprorepo used as a local file repo. Its pool/<dist>/main/
-# directories hold the .deb files (all arches mixed, exactly like the real
-# repo). dbs only adds/removes files here — never git add/commit — so the new
-# packages can be reviewed and committed by hand.
 LOCALREPO_DIR="${DBS_REPO_DIR:-$DBS_HOME/droneprorepo}"
 LOCALREPO="$LOCALREPO_DIR/pool/$DIST/main"
 
-# Make sure the droneprorepo clone exists; clone it on first use.
 ensure_localrepo() {
     if [ -d "$LOCALREPO_DIR/.git" ]; then
         return 0
@@ -294,20 +280,16 @@ ensure_localrepo() {
     git clone "$REPO_GIT_URL" "$LOCALREPO_DIR"
 }
 
-# Publish one built .deb into the repo pool, keeping only the newest version of
-# each package+arch. Prints a warning and returns non-zero (so the caller counts
-# it as skipped) when a newer version is already present.
 publish_deb() {
     local src="$1" pool="$2"
     local fname base arch rest version name
     fname="$(basename -- "$src")"
     base="${fname%.deb}"
-    arch="${base##*_}"          # name_version_arch -> arch
-    rest="${base%_*}"           # name_version
-    version="${rest##*_}"       # version (Debian versions have no '_')
-    name="${rest%_*}"           # name
+    arch="${base##*_}"
+    rest="${base%_*}"
+    version="${rest##*_}"
+    name="${rest%_*}"
 
-    # Highest version of this same package+arch already in the pool, if any.
     local newest_ver="" f b fver
     for f in "$pool/${name}"_*_"${arch}.deb"; do
         [ -e "$f" ] || continue
@@ -323,8 +305,6 @@ publish_deb() {
         return 1
     fi
 
-    # Newer (or equal, or first) version wins: drop every older copy so the pool
-    # keeps a single, newest version of this package+arch.
     for f in "$pool/${name}"_*_"${arch}.deb"; do
         [ -e "$f" ] || continue
         rm -f "$f"
@@ -338,9 +318,6 @@ publish_deb() {
     return 0
 }
 
-# Collapse a pool directory to a single newest version per package+arch, deleting
-# every older duplicate. Distinct versions have distinct filenames, so there are
-# no same-version ties to break here (those are handled when files are written).
 dedupe_pool() {
     local pool="$1"
     local -A best_ver best_file
@@ -361,10 +338,6 @@ dedupe_pool() {
     done
 }
 
-# git pull the package repo before publishing, resolving any divergence toward
-# the higher package version (and toward the local copy when versions match).
-# Always returns 0 so a repo/network hiccup never blocks the local publish; it is
-# meant to be called as `if ! repo_sync; then ...` so errexit can't abort here.
 repo_sync() {
     git -C "$LOCALREPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
 
@@ -390,24 +363,14 @@ repo_sync() {
     fi
 
     if [ "$(git -C "$LOCALREPO_DIR" rev-parse HEAD 2>/dev/null || true)" != "$upstream" ]; then
-        # A merge refuses to clobber a working-tree .deb that the incoming commit
-        # also touches. Our packages are exactly such files — untracked (just
-        # published, not yet committed) or tracked-but-modified (a same-version
-        # rebuild). Set both kinds aside, restore a clean tree, merge, then reapply
-        # them under the version rule (publish_deb keeps the newer one, local
-        # content on a tie) so a local edit never blocks pulling everyone else's.
         local stash_dir="$CTX/repo-untracked"
         mkdir -p "$stash_dir"
         local saved=() rel
-        # Untracked pool debs — no --exclude-standard, so a build that happens to
-        # be .gitignore'd is still set aside and can win a version tie locally.
         while IFS= read -r rel; do
             case "$rel" in *.deb) ;; *) continue ;; esac
             mkdir -p "$stash_dir/$(dirname "$rel")"
             mv "$LOCALREPO_DIR/$rel" "$stash_dir/$rel" && saved+=("$rel")
         done < <(git -C "$LOCALREPO_DIR" ls-files --others -- pool 2>/dev/null)
-        # Tracked pool debs modified in the worktree: copy aside, then check the
-        # committed content back out so the merge sees a clean path.
         while IFS= read -r rel; do
             case "$rel" in *.deb) ;; *) continue ;; esac
             mkdir -p "$stash_dir/$(dirname "$rel")"
@@ -415,8 +378,6 @@ repo_sync() {
             git -C "$LOCALREPO_DIR" checkout -q -- "$rel" 2>/dev/null || true
         done < <(git -C "$LOCALREPO_DIR" diff --name-only -- pool 2>/dev/null)
 
-        # -X ours: take our side for any genuine same-path conflict, so the merge
-        # never stops half-done; higher versions are different files and merge in.
         if ! git -C "$LOCALREPO_DIR" merge --no-edit --no-stat -X ours "$upstream" >/dev/null 2>&1; then
             echo "dbs: WARNING: git merge failed — keeping the local pool unchanged" >&2
             git -C "$LOCALREPO_DIR" merge --abort >/dev/null 2>&1 || true
@@ -428,8 +389,6 @@ repo_sync() {
         done
     fi
 
-    # The merge can pull an older copy alongside a newer one (a package, two
-    # versions, two filenames) — collapse this dist's pool to the newest of each.
     dedupe_pool "$LOCALREPO"
     return 0
 }
@@ -455,18 +414,14 @@ for dep in $HOST_DEPS; do
 done
 [ -n "$HOST_DEPS" ] && echo "dbs: extra host build tooling: $HOST_DEPS" >&2
 
-# --build-var KEY=VALUE entries are forwarded into the build container as
-# environment variables (see run_args below), where debian/rules picks them up
-# as make variables. Require a well-formed KEY so the value can't smuggle in a
-# second `-e` token or an empty/odd variable name.
 for kv in ${BUILD_VARS[@]+"${BUILD_VARS[@]}"}; do
     case "$kv" in
         [A-Za-z_]*=*) : ;;
-        *) echo "dbs: invalid --build-var '$kv' — expected KEY=VALUE with KEY a shell identifier" >&2; exit 1 ;;
+        *) echo "dbs: invalid '-D$kv' — expected -DKEY=VALUE with KEY a shell identifier" >&2; exit 1 ;;
     esac
     case "${kv%%=*}" in
         *[!A-Za-z0-9_]*)
-            echo "dbs: invalid --build-var '$kv' — KEY must match [A-Za-z_][A-Za-z0-9_]*" >&2; exit 1 ;;
+            echo "dbs: invalid '-D$kv' — KEY must match [A-Za-z_][A-Za-z0-9_]*" >&2; exit 1 ;;
     esac
 done
 [ "${#BUILD_VARS[@]}" -gt 0 ] && echo "dbs: build vars: ${BUILD_VARS[*]}" >&2
@@ -486,8 +441,6 @@ cp "$PROJECT_DIR/debian/control" "$CTX/debian/control"
 
 ensure_localrepo
 mkdir -p "$LOCALREPO" "$CTX/localrepo"
-# Stage the packages relevant to this build (target arch + arch-independent)
-# out of the shared pool into the docker context.
 n_repo=0
 for f in "$LOCALREPO"/*_"$DEB_ARCH".deb "$LOCALREPO"/*_all.deb; do
     [ -e "$f" ] || continue
@@ -547,7 +500,6 @@ else
                -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
 fi
 [ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
-# Forward --build-var KEY=VALUE entries so debian/rules can read them.
 for kv in ${BUILD_VARS[@]+"${BUILD_VARS[@]}"}; do run_args+=(-e "$kv"); done
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 

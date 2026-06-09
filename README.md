@@ -148,6 +148,7 @@ Cross-builds `PROJECT_DIR` (default: current directory). It must contain a
 | `-n`, `--native` | | off | Build **natively** inside the emulated target-arch container (QEMU) instead of cross-compiling. Slower, but builds packages that don't cross-compile. |
 | `-p`, `--publish` | | off | After a successful build, copy the `.deb`s into the [local package repo](#local-package-repo) so other projects can resolve them as `Build-Depends`. Without it, packages stay in `out/` only. |
 | `--host-deps` | `"PKG..."` | none | Extra build packages to install for the build (repeatable; also via `debian/dbs-host-deps`). Cross: on the amd64 host (Debian main only). Native: in the target container (Debian/Pi/droneprorepo). |
+| `-DKEY=VALUE` | | none | Forward a build variable into the build as an environment variable, read in `debian/rules` as `$(KEY)` (e.g. `-DPROT=ARDU` against a `PROT ?= MSP` default). cmake-style; the space form `-D KEY=VALUE` also works. Repeatable. `KEY` must be a shell identifier. |
 | `-h`, `--help` | | | Show usage |
 
 Anything after `--` is forwarded verbatim to `docker build` (e.g.
@@ -179,6 +180,9 @@ dbs -np                 # natively, then publish (bundled short flags)
 
 # force a clean docker build
 dbs --arch 64 -- --no-cache
+
+# override a build variable the project exposes in debian/rules (cmake-style)
+dbs -DPROT=ARDU
 ```
 
 To produce the full matrix, just run it four times:
