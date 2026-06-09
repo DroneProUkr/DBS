@@ -51,6 +51,11 @@ Build options:
                                container (Debian/Pi/dronerepo). A project may also
                                list them in debian/dbs-host-deps (one per line,
                                '#' comments).
+  --build-var KEY=VALUE        Forward an environment variable into the build,
+                               where debian/rules can read it as a make variable
+                               ($(KEY)) to vary the build — e.g. select a product
+                               variant. Repeatable. KEY must be a valid shell
+                               identifier ([A-Za-z_][A-Za-z0-9_]*).
   -h, --help                   Show this help
 
   Short flags may be bundled: -np is the same as -n -p, and a
@@ -177,6 +182,7 @@ LOCAL=0
 NATIVE=0
 PUBLISH=0
 HOST_DEPS=""
+BUILD_VARS=()
 PROJECT_DIR="$PWD"
 DOCKER_ARGS=()
 project_set=0
@@ -238,6 +244,8 @@ while [ $# -gt 0 ]; do
         --publish|-p)  PUBLISH=1;        shift ;;
         --host-deps)   need_val "$1" "$#"; HOST_DEPS="$HOST_DEPS $2"; shift 2 ;;
         --host-deps=*) HOST_DEPS="$HOST_DEPS ${1#*=}"; shift ;;
+        --build-var)   need_val "$1" "$#"; BUILD_VARS+=("$2"); shift 2 ;;
+        --build-var=*) BUILD_VARS+=("${1#*=}"); shift ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; DOCKER_ARGS+=("$@"); break ;;
         *)
@@ -447,6 +455,22 @@ for dep in $HOST_DEPS; do
 done
 [ -n "$HOST_DEPS" ] && echo "dbs: extra host build tooling: $HOST_DEPS" >&2
 
+# --build-var KEY=VALUE entries are forwarded into the build container as
+# environment variables (see run_args below), where debian/rules picks them up
+# as make variables. Require a well-formed KEY so the value can't smuggle in a
+# second `-e` token or an empty/odd variable name.
+for kv in ${BUILD_VARS[@]+"${BUILD_VARS[@]}"}; do
+    case "$kv" in
+        [A-Za-z_]*=*) : ;;
+        *) echo "dbs: invalid --build-var '$kv' — expected KEY=VALUE with KEY a shell identifier" >&2; exit 1 ;;
+    esac
+    case "${kv%%=*}" in
+        *[!A-Za-z0-9_]*)
+            echo "dbs: invalid --build-var '$kv' — KEY must match [A-Za-z_][A-Za-z0-9_]*" >&2; exit 1 ;;
+    esac
+done
+[ "${#BUILD_VARS[@]}" -gt 0 ] && echo "dbs: build vars: ${BUILD_VARS[*]}" >&2
+
 CTX="$(mktemp -d)"
 trap 'rm -rf "$CTX"' EXIT
 cp "$BUILDER_DIR/Dockerfile" \
@@ -523,6 +547,8 @@ else
                -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
 fi
 [ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
+# Forward --build-var KEY=VALUE entries so debian/rules can read them.
+for kv in ${BUILD_VARS[@]+"${BUILD_VARS[@]}"}; do run_args+=(-e "$kv"); done
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 
 [ -t 1 ] && run_args+=(-t)
