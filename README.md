@@ -82,6 +82,21 @@ On the **host** (tested on WSL2 / amd64):
 The cross toolchain, CMake, debhelper, etc. live *inside* the Docker image —
 you do **not** need them on the host.
 
+### Windows
+
+dbs itself is Linux-only, but on Windows it runs **unchanged inside WSL2** — a
+thin PowerShell shim forwards every call into your WSL distro (real `dpkg`,
+GitPython, and Docker Desktop's `docker`). You need:
+
+- **WSL2** with a Linux distro, e.g. `wsl --install -d Ubuntu`.
+- **Docker Desktop** with WSL integration enabled for that distro
+  (Settings → Resources → WSL integration) — this puts `docker` on PATH inside
+  WSL.
+- **PowerShell 7** (`pwsh`) for the shim.
+
+The Linux-side prerequisites above (`git`, `python3-git`) live inside the WSL
+distro; `install.ps1 -InstallDeps` installs them for you.
+
 ## Installation
 
 One-liner — clones DBS into `~/bin`, symlinks the CLI, adds `~/bin` to your
@@ -104,6 +119,36 @@ cd ~/bin
 git clone https://github.com/DroneProUkr/DBS.git
 ln -s DBS/dbs .                      # ~/bin/dbs -> DBS/dbs
 ```
+
+### Windows (PowerShell 7 + WSL2)
+
+From a **PowerShell 7** prompt:
+
+```powershell
+irm https://raw.githubusercontent.com/DroneProUkr/DBS/main/install.ps1 | iex
+```
+
+This installs dbs *inside* WSL (reusing `install.sh`), drops the shim `dbs.ps1`
+into `~\bin`, and registers a `dbs` function in your pwsh profile so `dbs …`
+works in any new PowerShell 7 window. When it finishes, open a new window and
+run `dbs --help`.
+
+For a non-default distro, or to also install the Linux prerequisites, download
+and run it with options instead of piping to `iex`:
+
+```powershell
+iwr https://raw.githubusercontent.com/DroneProUkr/DBS/main/install.ps1 -OutFile install.ps1
+./install.ps1 -InstallDeps -Distro Ubuntu
+```
+
+Usage is then identical to Linux — run `dbs` from any project directory.
+Windows paths passed as arguments (e.g. `dbs C:\src\libdatachannel`) are
+translated to their WSL `/mnt/<drive>/…` form automatically; set
+`$env:DBS_WSL_DISTRO` to target a specific distro for one invocation.
+
+> Building from a Windows-filesystem path (`/mnt/c/…`) works but is slower than
+> from the WSL filesystem; keep hot source trees inside WSL (`\\wsl$\…`) for the
+> best build speed.
 
 ---
 
@@ -406,6 +451,8 @@ is generated. Likewise, a missing `debian/source/format` defaults to
 | `aarch64-linux-gnu-pkg-config`, `arm-linux-gnueabihf-pkg-config` | `pkg-config` wrappers pointing at `/sysroot`. |
 | `rpi-arm64.toolchain.cmake`, `rpi-armhf.toolchain.cmake` | CMake cross-compile toolchains. |
 | `templates/control`, `templates/rules`, `templates/build-debs.yml` | Scaffolding `dbs init` writes into a new project. |
+| `dbs.ps1` | Windows shim: forwards `dbs` into WSL2 (path translation + login shell). |
+| `install.ps1` | Windows installer: sets up dbs in WSL and registers the `dbs` pwsh function. |
 
 ---
 
