@@ -256,9 +256,11 @@ esac
 
 case "$ARCH" in
     64) DEB_ARCH="arm64"; GNU="aarch64-linux-gnu"; PLATFORM="linux/arm64"
-        TOOLCHAIN="rpi-arm64.toolchain.cmake"; CROSS="crossbuild-essential-arm64" ;;
+        TOOLCHAIN="rpi-arm64.toolchain.cmake"; CROSS="crossbuild-essential-arm64"
+        QEMU_NAME="arm64"; QEMU_HANDLER="qemu-aarch64" ;;
     32) DEB_ARCH="armhf"; GNU="arm-linux-gnueabihf"; PLATFORM="linux/arm/v7"
-        TOOLCHAIN="rpi-armhf.toolchain.cmake"; CROSS="crossbuild-essential-armhf" ;;
+        TOOLCHAIN="rpi-armhf.toolchain.cmake"; CROSS="crossbuild-essential-armhf"
+        QEMU_NAME="arm"; QEMU_HANDLER="qemu-arm" ;;
     *)  echo "dbs: --arch must be '32' or '64' (got '$ARCH')" >&2; exit 1 ;;
 esac
 
@@ -278,6 +280,36 @@ ensure_localrepo() {
     fi
     echo "dbs: cloning package repo $REPO_GIT_URL -> $LOCALREPO_DIR" >&2
     git clone "$REPO_GIT_URL" "$LOCALREPO_DIR"
+}
+
+# The sysroot stage installs target-arch packages, and --native builds run the
+# whole toolchain, under QEMU user emulation. That needs a binfmt_misc handler
+# registered in the kernel; without it the first target-arch binary dies with
+# "exec /bin/sh: exec format error". WSL and Docker Desktop don't persist these
+# registrations across restarts, so register on demand. No-op on a native ARM
+# host (kernel runs the binaries directly) and once the handler is present.
+ensure_binfmt() {
+    # Native ARM host needs no emulation for ARM targets.
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) return 0 ;;
+    esac
+    if [ -r "/proc/sys/fs/binfmt_misc/$QEMU_HANDLER" ] \
+       && grep -qx enabled "/proc/sys/fs/binfmt_misc/$QEMU_HANDLER" 2>/dev/null; then
+        return 0
+    fi
+    echo "dbs: QEMU $QEMU_NAME emulation not registered — installing binfmt handler ..." >&2
+    if ! docker run --privileged --rm tonistiigi/binfmt --install "$QEMU_NAME" >/dev/null 2>&1; then
+        echo "dbs: WARNING: failed to register QEMU emulation for $QEMU_NAME." >&2
+        echo "dbs: run manually: docker run --privileged --rm tonistiigi/binfmt --install $QEMU_NAME" >&2
+        return 1
+    fi
+    if [ -r "/proc/sys/fs/binfmt_misc/$QEMU_HANDLER" ] \
+       && grep -qx enabled "/proc/sys/fs/binfmt_misc/$QEMU_HANDLER" 2>/dev/null; then
+        echo "dbs: QEMU $QEMU_NAME emulation registered." >&2
+    else
+        echo "dbs: WARNING: QEMU handler '$QEMU_HANDLER' still not enabled after install." >&2
+    fi
 }
 
 publish_deb() {
@@ -480,13 +512,26 @@ if [ "$NATIVE" -eq 0 ]; then
     build_args+=(--build-arg "CROSS_PKG=$CROSS")
 fi
 
+ensure_binfmt
+
+# --provenance/--sbom=false: BuildKit (Docker 23+/buildx) adds a provenance
+# attestation by default, which turns even a single-platform build into a manifest
+# LIST. The list digest written to --iidfile is then not runnable — `docker run
+# <iid>` fails with "No such image: sha256:<list>". Disabling attestations makes the
+# iidfile hold a plain image digest again.
 docker build --progress=plain "${DOCKER_ARGS[@]}" \
+    --provenance=false --sbom=false \
     --platform "$BUILD_PLATFORM" \
     --target "$TARGET" \
     --iidfile "$CTX/iid" \
     "${build_args[@]}" \
     -t "$TAG" "$CTX"
 IMAGE_ID="$(cat "$CTX/iid")"
+# Prefer the tag over the iidfile digest for `docker run`. With the classic (non-
+# containerd) image store on recent Docker/buildx, the digest written to --iidfile
+# (manifest/config digest) is not a key `docker run` can resolve → "No such image:
+# sha256:...". The image is loaded under "$TAG" ("naming to ... done"), so run that.
+[ -n "$TAG" ] && IMAGE_ID="$TAG"
 
 run_args=(--rm --platform "$BUILD_PLATFORM" -v "$PROJECT_DIR:/workspace"
           -e "DBS_DIST=$DIST"
