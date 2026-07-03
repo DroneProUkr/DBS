@@ -100,8 +100,11 @@ distro; `install.ps1 -InstallDeps` installs them for you.
 ## Installation
 
 One-liner — clones DBS into `~/bin`, symlinks the CLI, adds `~/bin` to your
-`PATH` (via `~/.bashrc`) if it isn't there already, and reports any missing
-runtime dependencies:
+`PATH` (via `~/.bashrc`) if it isn't there already, and **auto-installs any
+missing runtime dependencies** (`git`, `docker.io`, `python3`, the
+`python3-git`/GitPython library) via `apt` — using `sudo` when not run as root.
+On non-apt hosts, or when it can't elevate, it falls back to printing the
+`sudo apt install …` command to run by hand:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/DroneProUkr/DBS/main/install.sh | sh
