@@ -46,9 +46,16 @@ Build options:
   --host-deps "PKG..."         Extra build packages for build tools the
                                auto-detection can't classify (e.g.
                                protobuf-compiler). Repeatable; space-separated.
+                               A package may be qualified with the apt release it
+                               must come from — "cmake/bookworm-backports" — which
+                               is how a project gets something newer than its
+                               suite's main archive offers. Qualified entries are
+                               skipped when the release does not belong to the
+                               suite being built, so one list serves every suite.
                                Cross: installed on the amd64 build host (Debian
-                               main only). Native: installed in the target-arch
-                               container (Debian/Pi/dronerepo). A project may also
+                               main, or that suite's backports when qualified).
+                               Native: installed in the target-arch container
+                               (Debian/Pi/dronerepo). A project may also
                                list them in debian/dbs-host-deps (one per line,
                                '#' comments).
   -DKEY=VALUE                  Forward a build variable into the build as an
@@ -438,11 +445,28 @@ if [ -f "$host_deps_file" ]; then
 fi
 HOST_DEPS="$(printf '%s' "$HOST_DEPS" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')"
 for dep in $HOST_DEPS; do
+    # A host-dep is a bare package name, optionally qualified with the apt release it
+    # must come from ("cmake/bookworm-backports"). The qualified form is skipped when
+    # its release does not belong to the suite being built, so one dbs-host-deps file
+    # can serve every suite in a build matrix.
     case "$dep" in
+        */*/*) echo "dbs: invalid host-dep '$dep' — at most one '/suite' qualifier" >&2
+               exit 1 ;;
+        */*)   dep_name="${dep%%/*}"; dep_rel="${dep#*/}" ;;
+        *)     dep_name="$dep";       dep_rel="" ;;
+    esac
+    case "$dep_name" in
         [!a-z0-9]*|*[!a-z0-9+.-]*)
-            echo "dbs: invalid host-dep '$dep' — expected a bare package name" >&2
+            echo "dbs: invalid host-dep '$dep' — expected a bare package name, optionally 'name/suite'" >&2
             exit 1 ;;
     esac
+    if [ -n "$dep_rel" ]; then
+        case "$dep_rel" in
+            [!a-z0-9]*|*[!a-z0-9.-]*)
+                echo "dbs: invalid host-dep suite '$dep_rel' in '$dep'" >&2
+                exit 1 ;;
+        esac
+    fi
 done
 [ -n "$HOST_DEPS" ] && echo "dbs: extra host build tooling: $HOST_DEPS" >&2
 

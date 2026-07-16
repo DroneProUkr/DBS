@@ -66,6 +66,13 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' \
         > /etc/apt/apt.conf.d/keep-cache
 
+# ${SUITE}-backports is enabled but never used on its own: backports is flagged
+# NotAutomatic (apt priority 100), so this cannot change what any existing build
+# installs. It only makes an explicitly qualified host-dep ("cmake/bookworm-backports")
+# resolvable — the escape hatch for projects needing a tool newer than the suite ships.
+RUN echo "deb http://deb.debian.org/debian ${SUITE}-backports main" \
+        > /etc/apt/sources.list.d/backports.list
+
 RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-buildhost,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-buildhost,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -104,15 +111,25 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-buildhost,sha
     host_deps="$(dbs-host-deps /tmp/control)" && \
     echo "dbs: auto host tooling : ${host_deps:-<none>}" && \
     echo "dbs: extra host tooling: ${HOST_DEPS:-<none>}" && \
+    extra_deps="" && \
     if [ -n "$HOST_DEPS" ]; then \
-        names="$(apt-cache pkgnames)" && \
+        names="$(apt-cache pkgnames)"; \
         for p in $HOST_DEPS; do \
-            printf '%s\n' "$names" | grep -Fxq "$p" || \
-                { echo "dbs: host-dep '$p' is not a package in the build-host archive (Debian main)" >&2; exit 1; }; \
+            case "$p" in \
+                */*) n="${p%%/*}"; r="${p#*/}" ;; \
+                *)   n="$p";       r="" ;; \
+            esac; \
+            if [ -n "$r" ] && [ "${r%%-*}" != "$SUITE" ]; then \
+                echo "dbs: host-dep '$p' is for '${r%%-*}' — skipped on ${SUITE}"; \
+                continue; \
+            fi; \
+            printf '%s\n' "$names" | grep -Fxq "$n" || \
+                { echo "dbs: host-dep '$n' is not a package in the build-host archive (Debian main/backports)" >&2; exit 1; }; \
+            extra_deps="$extra_deps $p"; \
         done; \
     fi && \
-    if [ -n "$host_deps$HOST_DEPS" ]; then \
-        apt-get install -y --no-install-recommends $host_deps $HOST_DEPS; \
+    if [ -n "$host_deps$extra_deps" ]; then \
+        apt-get install -y --no-install-recommends $host_deps $extra_deps; \
     fi && \
     rm -f /tmp/control
 
@@ -128,6 +145,13 @@ ARG SUITE
 ARG DEB_ARCH=arm64
 ARG HOST_DEPS=
 ENV DEBIAN_FRONTEND=noninteractive
+# ${SUITE}-backports is enabled but never used on its own: backports is flagged
+# NotAutomatic (apt priority 100), so this cannot change what any existing build
+# installs. It only makes an explicitly qualified host-dep ("cmake/bookworm-backports")
+# resolvable — the escape hatch for projects needing a tool newer than the suite ships.
+RUN echo "deb http://deb.debian.org/debian ${SUITE}-backports main" \
+        > /etc/apt/sources.list.d/backports.list
+
 RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},sharing=locked \
     --mount=type=cache,target=/var/lib/apt,id=apt-lib-${SUITE}-${DEB_ARCH},sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -143,11 +167,23 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-${SUITE}-${DEB_ARCH},s
     if [ -n "$HOST_DEPS" ]; then \
         apt-get update && \
         names="$(apt-cache pkgnames)" && \
+        extra_deps="" && \
         for p in $HOST_DEPS; do \
-            printf '%s\n' "$names" | grep -Fxq "$p" || \
-                { echo "dbs: host-dep '$p' is not a package in the target archives (Debian/Pi/droneprorepo)" >&2; exit 1; }; \
+            case "$p" in \
+                */*) n="${p%%/*}"; r="${p#*/}" ;; \
+                *)   n="$p";       r="" ;; \
+            esac; \
+            if [ -n "$r" ] && [ "${r%%-*}" != "$SUITE" ]; then \
+                echo "dbs: host-dep '$p' is for '${r%%-*}' — skipped on ${SUITE}"; \
+                continue; \
+            fi; \
+            printf '%s\n' "$names" | grep -Fxq "$n" || \
+                { echo "dbs: host-dep '$n' is not a package in the target archives (Debian/Pi/droneprorepo)" >&2; exit 1; }; \
+            extra_deps="$extra_deps $p"; \
         done && \
-        apt-get install -y --no-install-recommends $HOST_DEPS; \
+        if [ -n "$extra_deps" ]; then \
+            apt-get install -y --no-install-recommends $extra_deps; \
+        fi; \
     fi
 
 COPY crossbuild /usr/bin/crossbuild
