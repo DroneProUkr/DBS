@@ -11,7 +11,17 @@ DEB_HOST_ARCH="${DEB_HOST_ARCH:-arm64}"
 DEB_HOST_GNU_TYPE="${DEB_HOST_GNU_TYPE:-aarch64-linux-gnu}"
 
 mkdir -p "$BUILD"
-cp -r "$WORKSPACE"/. "$BUILD"
+if [ -n "${DBS_QUICK:-}" ]; then
+    # Quick mode: /build is a persistent host-mounted cache. Refresh sources
+    # PRESERVING mtimes (cp -a) so unchanged files keep their timestamps and
+    # make/ninja rebuilds only what actually changed. Stale deleted files are
+    # tolerated — nuke the cache dir for a pristine build.
+    cp -a "$WORKSPACE"/. "$BUILD"
+    # debhelper's stamp would make `dh build` a no-op on the second run.
+    rm -f "$BUILD/debian/debhelper-build-stamp"
+else
+    cp -r "$WORKSPACE"/. "$BUILD"
+fi
 cd "$BUILD"
 
 # Never carry a previous run's output tree into the build (it is bind-mounted
@@ -30,13 +40,19 @@ if [ ! -f debian/source/format ]; then
     printf '3.0 (native)\n' > debian/source/format
 fi
 
+# Quick mode: skip dpkg-buildpackage's pre-clean (`debian/rules clean` wipes
+# the cmake obj dir) so the persistent /build cache stays warm and the build
+# is incremental.
+DPKG_BP_EXTRA=()
+[ -n "${DBS_QUICK:-}" ] && DPKG_BP_EXTRA+=(-nc)
+
 if [ -n "${DBS_NATIVE:-}" ]; then
     # Native mode (dbs --native): this container already runs the target
     # architecture under QEMU, so there is no sysroot, cross toolchain, or
     # --host-arch — build in place exactly as the package would on real
     # hardware. Slower, but sidesteps every cross-compilation quirk (Python/Java
     # bindings, cmake configs that bake in absolute /usr paths, etc.).
-    DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b
+    DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b ${DPKG_BP_EXTRA[@]+"${DPKG_BP_EXTRA[@]}"}
 else
     # Cross mode: point the build at the target sysroot and cross toolchain.
     # Toolchain file: explicit arg wins, then the env from `dbs`, then arm64.
@@ -46,7 +62,7 @@ else
 
     export LD_LIBRARY_PATH="$SYSROOT/usr/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/lib/$DEB_HOST_GNU_TYPE:$SYSROOT/usr/lib"
 
-    DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch "$DEB_HOST_ARCH"
+    DEB_BUILD_OPTIONS="noautodbgsym nocheck" dpkg-buildpackage -us -uc -b -d --host-arch "$DEB_HOST_ARCH" ${DPKG_BP_EXTRA[@]+"${DPKG_BP_EXTRA[@]}"}
 fi
 
 if [ -n "${DBS_LOCAL:-}" ]; then

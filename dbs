@@ -43,6 +43,15 @@ Build options:
                                package repo so other projects can use them as
                                Build-Depends. Without this, builds stay in
                                out/<dist>/<arch>/ only.
+  -q, --quick                  Incremental rebuild: keep the container's /build
+                               tree in a persistent cache dir under
+                               $DBS_HOME/quickbuild/<project>-<dist>-<arch>/,
+                               refresh sources preserving mtimes and run
+                               dpkg-buildpackage with -nc (no pre-clean), so
+                               only changed files recompile. First run is a
+                               normal full build that seeds the cache. The
+                               cache is written by the (root) container — use
+                               sudo rm -rf to drop it if a build goes weird.
   --host-deps "PKG..."         Extra build packages for build tools the
                                auto-detection can't classify (e.g.
                                protobuf-compiler). Repeatable; space-separated.
@@ -180,6 +189,7 @@ DIST="trixie"
 ARCH="64"
 LOCAL=0
 NATIVE=0
+QUICK=0
 PUBLISH=0
 HOST_DEPS=""
 BUILD_VARS=()
@@ -200,7 +210,7 @@ expand_short_opts() {
                 while [ -n "$opt" ]; do
                     c="${opt:0:1}"; opt="${opt:1}"
                     case "$c" in
-                        l|n|p|h) cluster+=("-$c") ;;
+                        l|n|p|q|h) cluster+=("-$c") ;;
                         d|a)
                             if [ -n "$opt" ]; then
                                 cluster+=("-$c" "${opt#=}"); opt=""
@@ -240,6 +250,7 @@ while [ $# -gt 0 ]; do
         --local|-l)    LOCAL=1;          shift ;;
         --native|-n)   NATIVE=1;         shift ;;
         --publish|-p)  PUBLISH=1;        shift ;;
+        --quick|-q)    QUICK=1;          shift ;;
         --host-deps)   need_val "$1" "$#"; HOST_DEPS="$HOST_DEPS $2"; shift 2 ;;
         --host-deps=*) HOST_DEPS="$HOST_DEPS ${1#*=}"; shift ;;
         -D)            need_val "$1" "$#"; BUILD_VARS+=("$2"); shift 2 ;;
@@ -569,6 +580,18 @@ else
                -e "CMAKE_TOOLCHAIN_FILE=/opt/$TOOLCHAIN")
 fi
 [ "$LOCAL" -eq 1 ] && run_args+=(-e "DBS_LOCAL=1")
+if [ "$QUICK" -eq 1 ]; then
+    # Persistent /build between runs: sources are refreshed into it preserving
+    # mtimes and the build skips the pre-clean (crossbuild honours DBS_QUICK),
+    # so cmake/make touch only what actually changed. Keyed per project+dist+
+    # arch(+native) — mixing them would poison the object cache.
+    QCACHE_SUFFIX=""
+    [ "$NATIVE" -eq 1 ] && QCACHE_SUFFIX="-native"
+    QCACHE="$DBS_HOME/quickbuild/$(basename "$PROJECT_DIR")-$DIST-$DEB_ARCH$QCACHE_SUFFIX"
+    mkdir -p "$QCACHE"
+    echo "dbs: quick mode — incremental build cache: $QCACHE" >&2
+    run_args+=(-v "$QCACHE:/build" -e "DBS_QUICK=1")
+fi
 for kv in ${BUILD_VARS[@]+"${BUILD_VARS[@]}"}; do run_args+=(-e "$kv"); done
 [ -n "$GEN_CL" ] && run_args+=(-v "$GEN_CL:/run/dbs/changelog:ro")
 
