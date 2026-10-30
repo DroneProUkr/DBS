@@ -23,6 +23,10 @@ Versioning mirrors the old shell generator exactly:
   * distribution is `stable` only when exactly on a release tag (no `+N`) and
     the major version is >= 1; otherwise `unstable`.
 
+A packaging-only change (same upstream tree) bumps the version through an
+optional `debian/dbs-revision` in the project: its value becomes the Debian
+revision of the newest stanza (`1.27.1` -> `1.27.1-1`).
+
 Requires GitPython (Debian/Ubuntu: `sudo apt install python3-git`) and the
 `git` binary.
 """
@@ -77,6 +81,31 @@ def maintainer_name(control: str) -> str:
     """The Maintainer field with any `<email>` (and trailing text) stripped."""
     value = read_control_field(control, "Maintainer")
     return re.sub(r"\s*<[^>]*>.*", "", value)
+
+
+def read_revision(project: str) -> str:
+    """The Debian revision from debian/dbs-revision, or "" when there is none.
+
+    The first non-empty line once `#` comments are stripped (the same shape as
+    debian/dbs-host-deps). The version is derived from the upstream tree, so a
+    change to the wrapper's debian/ alone would otherwise rebuild the same
+    version with different contents, which apt never upgrades to.
+    """
+    path = os.path.join(project, "debian", "dbs-revision")
+    if not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            value = line.split("#", 1)[0].strip()
+            if value:
+                break
+        else:
+            return ""
+    # Debian policy: a revision holds only alphanumerics and + . ~
+    if not re.fullmatch(r"[A-Za-z0-9+.~]+", value):
+        sys.exit(f"dbs-changelog: invalid revision {value!r} in {path} — "
+                 "expected alphanumerics and + . ~ only")
+    return value
 
 
 def read_sourcedirectory(rules: str) -> str:
@@ -202,9 +231,16 @@ def emit_entry(pkg, ver, name, email, date, fallback, body):
     return "\n".join(lines)
 
 
-def generate(src: str, pkg: str, control: str) -> str:
-    """Build a complete debian/changelog for `pkg` from the git history at `src`."""
+def generate(src: str, pkg: str, control: str, revision: str = "") -> str:
+    """Build a complete debian/changelog for `pkg` from the git history at `src`.
+
+    A non-empty `revision` is appended (`-<revision>`) to the newest stanza's
+    version only; older stanzas describe versions already released.
+    """
     fb_name = maintainer_name(control) or FALLBACK_NAME
+
+    def newest(ver: str) -> str:
+        return f"{ver}-{revision}" if revision else ver
 
     # Not a git repo, or a repo with no commits -> single fallback entry.
     try:
@@ -213,7 +249,7 @@ def generate(src: str, pkg: str, control: str) -> str:
     except (git.InvalidGitRepositoryError, git.NoSuchPathError):
         repo, has_head = None, False
     if repo is None or not has_head:
-        stanza = emit_entry(pkg, "0.0.1", fb_name, FALLBACK_EMAIL,
+        stanza = emit_entry(pkg, newest("0.0.1"), fb_name, FALLBACK_EMAIL,
                             rfc2822_now(), "Initial version", [])
         return stanza + "\n"
 
@@ -226,7 +262,7 @@ def generate(src: str, pkg: str, control: str) -> str:
     if not tags:
         name, email, date = commit_meta(repo, "HEAD")
         count = repo.git.rev_list("--count", "HEAD")
-        stanza = emit_entry(pkg, f"0.0.1+{count}", name, email, date,
+        stanza = emit_entry(pkg, newest(f"0.0.1+{count}"), name, email, date,
                             "Initial version", log_subjects(repo, "HEAD"))
         return stanza + "\n"
 
@@ -237,7 +273,7 @@ def generate(src: str, pkg: str, control: str) -> str:
     ahead = repo.git.rev_list("--count", f"{nearest}..HEAD")
     if int(ahead) > 0:
         name, email, date = commit_meta(repo, "HEAD")
-        ver = f"{tag_version(nearest)}+{ahead}"
+        ver = newest(f"{tag_version(nearest)}+{ahead}")
         stanzas.append(emit_entry(pkg, ver, name, email, date, "Snapshot build",
                                   log_subjects(repo, f"{nearest}..HEAD")))
 
@@ -247,6 +283,8 @@ def generate(src: str, pkg: str, control: str) -> str:
         prev = tags[i + 1] if i + 1 < len(tags) else None
         revrange = f"{prev}..{tag}" if prev else tag
         ver = tag_version(tag)
+        if not stanzas:
+            ver = newest(ver)
         name, email, date = commit_meta(repo, f"{tag}^{{commit}}")
         stanzas.append(emit_entry(pkg, ver, name, email, date,
                                   f"Released version {ver}", log_subjects(repo, revrange)))
@@ -282,8 +320,11 @@ def main() -> int:
 
     pkg = args.package or read_control_field(control, "Source") or os.path.basename(project)
 
-    print(f"dbs-changelog: source={src} package={pkg}", file=sys.stderr)
-    sys.stdout.write(generate(src, pkg, control))
+    revision = read_revision(project)
+
+    print(f"dbs-changelog: source={src} package={pkg}"
+          + (f" revision={revision}" if revision else ""), file=sys.stderr)
+    sys.stdout.write(generate(src, pkg, control, revision))
     return 0
 
 

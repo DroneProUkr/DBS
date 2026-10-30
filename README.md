@@ -407,6 +407,14 @@ fields `dbs` cares about:
   archives. Each entry must be an **exact** package name; an unknown name (e.g.
   a typo) fails the build with a clear error rather than being silently
   substring-expanded by `apt-get`.
+- **`debian/dbs-revision`** *(optional)* — a Debian revision for a
+  packaging-only change. The version comes from the upstream tree, so a change
+  to the wrapper's `debian/` alone (a new `Replaces:`, a cmake flag) would
+  rebuild the *same* version with different contents, and apt never upgrades to
+  that. The file's first non-comment line (`#` starts a comment) becomes the
+  revision of the newest changelog entry: `1` turns `1.27.1` into `1.27.1-1`.
+  Raise it for the next packaging change and delete the file when the submodule
+  moves to a new upstream version.
 
 `debian/changelog` and `debian/source/format` are **optional** — see below.
 
@@ -426,6 +434,8 @@ tool) and bind-mounts it into the build. Highlights:
   `release-1.2.3`); `tag+N` denotes *N* commits on top of a tag.
 - Falls back to `0.0.1+<commits>` when no tag yields a version, or a single
   `0.0.1` "Initial version" entry when the tree isn't a git repo.
+- A `debian/dbs-revision` in the project appends `-<revision>` to the newest
+  entry's version (see above).
 - Distribution is `stable` only when sitting exactly on a release tag (no
   `+N`) **and** major version ≥ 1; otherwise `unstable`.
 
