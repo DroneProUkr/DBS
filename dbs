@@ -1,7 +1,17 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-BUILDER_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve this script's real directory, following symlinks — portable across GNU
+# and BSD/macOS (macOS `readlink` has no `-f`). The installer symlinks
+# ~/bin/dbs -> DBS/dbs, so we must resolve to the real DBS/ dir to find templates.
+_dbs_src="${BASH_SOURCE[0]}"
+while [ -h "$_dbs_src" ]; do
+    _dbs_dir="$(cd -P -- "$(dirname -- "$_dbs_src")" && pwd)"
+    _dbs_src="$(readlink -- "$_dbs_src")"
+    case "$_dbs_src" in /*) ;; *) _dbs_src="$_dbs_dir/$_dbs_src" ;; esac
+done
+BUILDER_DIR="$(cd -P -- "$(dirname -- "$_dbs_src")" && pwd)"
+unset _dbs_src _dbs_dir
 
 usage() {
     cat >&2 <<'EOF'
@@ -307,6 +317,11 @@ ensure_localrepo() {
 # registrations across restarts, so register on demand. No-op on a native ARM
 # host (kernel runs the binaries directly) and once the handler is present.
 ensure_binfmt() {
+    # macOS: Docker Desktop's Linux VM provides QEMU/binfmt for foreign arches and
+    # there is no host /proc/binfmt_misc to inspect — trust Docker Desktop. (If an
+    # armhf build ever hits "exec format error", register once by hand:
+    # docker run --privileged --rm tonistiigi/binfmt --install arm)
+    [ "$(uname -s)" = Darwin ] && return 0
     # Native ARM host needs no emulation for ARM targets.
     case "$(uname -m)" in
         x86_64|amd64) ;;
@@ -554,7 +569,7 @@ ensure_binfmt
 # LIST. The list digest written to --iidfile is then not runnable — `docker run
 # <iid>` fails with "No such image: sha256:<list>". Disabling attestations makes the
 # iidfile hold a plain image digest again.
-docker build --progress=plain "${DOCKER_ARGS[@]}" \
+docker build --progress=plain ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} \
     --provenance=false --sbom=false \
     --platform "$BUILD_PLATFORM" \
     --target "$TARGET" \
@@ -599,8 +614,22 @@ for kv in ${BUILD_VARS[@]+"${BUILD_VARS[@]}"}; do run_args+=(-e "$kv"); done
 docker run "${run_args[@]}" "$IMAGE_ID"
 
 if [ "$LOCAL" -eq 0 ] && [ "$PUBLISH" -eq 1 ]; then
+    # Publishing compares Debian versions (dpkg) and dedupes the pool with an
+    # associative array (bash >= 4). Stock macOS ships neither — guide the user
+    # instead of crashing; the built packages remain in out/ either way.
+    pub_ok=1
+    if ! command -v dpkg >/dev/null 2>&1; then
+        echo "dbs: --publish needs 'dpkg' for version comparison (macOS: brew install dpkg)" >&2
+        pub_ok=0
+    fi
+    if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+        echo "dbs: --publish needs bash >= 4 (macOS: brew install bash, then reopen the shell)" >&2
+        pub_ok=0
+    fi
     out_dir="$PROJECT_DIR/out/$DIST/$DEB_ARCH"
-    if compgen -G "$out_dir/*.deb" >/dev/null; then
+    if [ "$pub_ok" -eq 0 ]; then
+        echo "dbs: build finished — packages in $out_dir/; publish skipped (see above)" >&2
+    elif compgen -G "$out_dir/*.deb" >/dev/null; then
         mkdir -p "$LOCALREPO"
         if ! repo_sync; then
             echo "dbs: WARNING: package repo sync hit an error — continuing" >&2

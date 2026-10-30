@@ -97,6 +97,24 @@ GitPython, and Docker Desktop's `docker`). You need:
 The Linux-side prerequisites above (`git`, `python3-git`) live inside the WSL
 distro; `install.ps1 -InstallDeps` installs them for you.
 
+### macOS
+
+Unlike Windows, dbs runs **natively on macOS** (Apple Silicon or Intel) — no VM
+or WSL. It drives Docker Desktop directly, exactly as it does on Linux. You need:
+
+- **Docker Desktop** — provides `docker` and the QEMU emulation dbs relies on.
+- **git**, **python3**, and **GitPython** (`python3 -m pip install --user GitPython`).
+- For **`dbs --publish`** only: **bash ≥ 4** and **dpkg**. Stock macOS ships bash 3.2
+  and no dpkg, so install them with Homebrew — `brew install bash dpkg`. Plain
+  builds work on the stock shell; only publishing needs these (dbs prints a hint
+  and leaves the built packages in `out/` if they're missing).
+
+On Apple Silicon, `dbs --native -a 64` builds arm64 **natively** — fast, no
+emulation, and the recommended mode. The default (cross) mode runs the amd64
+toolchain under emulation and works too, just slower. Keep source trees under a
+Docker-Desktop-shared path (your home directory, `/tmp`, …) so the workspace
+bind-mount resolves.
+
 ## Installation
 
 One-liner — clones DBS into `~/bin`, symlinks the CLI, adds `~/bin` to your
@@ -152,6 +170,26 @@ translated to their WSL `/mnt/<drive>/…` form automatically; set
 > Building from a Windows-filesystem path (`/mnt/c/…`) works but is slower than
 > from the WSL filesystem; keep hot source trees inside WSL (`\\wsl$\…`) for the
 > best build speed.
+
+### macOS
+
+The same one-liner works — the installer detects macOS, installs anything missing
+with **Homebrew** (and pip for GitPython), points you at Docker Desktop if it's
+absent, and adds `~/bin` to your `~/.zshrc`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DroneProUkr/DBS/main/install.sh | sh
+```
+
+Homebrew is required for the auto-install of `bash`/`dpkg` (the publish tooling);
+without it the installer prints the `brew install …` commands to run by hand.
+Usage is then identical to Linux.
+
+The clone goes to `~/bin/DBS-src` (link `~/bin/dbs -> DBS-src/dbs`), not
+`~/bin/DBS`: the default macOS volume is case-insensitive, so `DBS` and `dbs`
+would be one name there. For the same reason the manual steps above need
+`git clone https://github.com/DroneProUkr/DBS.git DBS-src` and
+`ln -s DBS-src/dbs .` on a Mac.
 
 ---
 
